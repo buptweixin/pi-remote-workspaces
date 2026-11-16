@@ -1,0 +1,19 @@
+docs/releasing.md
+  s_c2054e20436ada::t_6c2b7615281bae 40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "d33815c45e5620e01900cfbeb7a5d9119a6949f9",
+  "prompts": {},
+  "sessions": {
+    "s_c2054e20436ada": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1e388-3299-7c22-854e-65c8e3e80f14",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Arno Wei <8131131+buptweixin@users.noreply.github.com>"
+    }
+  }
+}
