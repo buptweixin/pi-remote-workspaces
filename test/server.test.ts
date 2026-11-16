@@ -1,0 +1,45 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { request as httpRequest } from "node:http";
+import { ConfigStore } from "../src/config.js";
+import { startDashboard } from "../src/server.js";
+import { RemoteClient } from "../src/remote.js";
+import { temporary, localTransport } from "./helpers.js";
+
+test("dashboard protects its API and completes workspace/file configuration flows", async t => {
+  const root = await temporary(t), store = new ConfigStore(join(root, "remote.json"));
+  const dashboard = await startDashboard({ store, client: (w, c) => new RemoteClient(w, c, localTransport) });
+  t.after(() => dashboard.close());
+  const url = new URL(dashboard.url), token = new URLSearchParams(url.hash.slice(1)).get("token");
+  const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+  const request = (path: string, method: string, data?: unknown, extra = {}) => fetch(url.origin + path, { method, headers: { ...headers, ...extra }, ...(data === undefined ? {} : { body: JSON.stringify(data) }) });
+  assert.equal((await fetch(`${url.origin}/api/state`)).status, 401);
+  assert.equal((await request("/api/state", "GET", undefined, { Origin: "https://attacker.example" })).status, 403);
+  const withHost = (host: string, origin?: string) => new Promise<number>((resolve, reject) => {
+    const req = httpRequest(`${url.origin}/api/state`, { headers: { ...headers, Host: host, ...(origin ? { Origin: origin } : {}) } }, res => { res.resume(); res.on("end", () => resolve(res.statusCode!)); });
+    req.on("error", reject); req.end();
+  });
+  assert.equal(await withHost("attacker.example"), 403);
+  assert.equal(await withHost("127.0.0.1:30142", "http://127.0.0.1:30142"), 200);
+  const html = await fetch(url.origin); assert.match(html.headers.get("content-security-policy")!, /frame-ancestors 'none'/);
+  assert.match(await html.text(), /Pi Remote/);
+  let response = await request("/api/workspaces", "POST", { id: "demo", name: "Demo", host: "fixture", path: root });
+  assert.equal(response.status, 201);
+  response = await request("/api/workspaces", "POST", { id: "demo", name: "Duplicate", host: "fixture", path: root });
+  assert.equal(response.status, 400);
+  await writeFile(join(root, "hello.txt"), "hello");
+  const original = await (await request("/api/workspaces/demo/read", "POST", { path: "hello.txt" })).json();
+  assert.equal(Buffer.from(original.data, "base64").toString(), "hello");
+  response = await request("/api/workspaces/demo/write", "POST", { path: "hello.txt", content: "changed", etag: original.etag });
+  assert.equal(response.status, 200);
+  response = await request("/api/workspaces/demo/write", "POST", { path: "hello.txt", content: "stale", etag: original.etag });
+  assert.equal(response.status, 400); assert.match((await response.json()).error, /conflict/);
+  response = await request("/api/workspaces/demo/read", "POST", { path: "../outside" });
+  assert.equal(response.status, 400);
+  response = await request("/api/config", "PUT", { connectTimeoutSeconds: 20, commandTimeoutSeconds: 180 });
+  assert.equal(response.status, 200); assert.equal((await store.read()).workspaces.length, 1);
+  assert.equal((await request("/api/workspaces/demo", "DELETE")).status, 200);
+  assert.equal((await store.read()).workspaces.length, 0);
+});
