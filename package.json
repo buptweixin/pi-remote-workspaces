@@ -1,6 +1,6 @@
 {
   "name": "@arnowei/pi-remote-workspaces",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "SSH workspaces for pi and pi-web, powered by your OpenSSH config",
   "type": "module",
   "license": "MIT",

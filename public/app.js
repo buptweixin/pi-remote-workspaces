@@ -25,6 +25,7 @@ function node(tag, text, className) { const item = document.createElement(tag); 
 function clearFile() { fileReadSequence++; file = undefined; $("file-name").textContent = "选择文件以查看或编辑"; $("file-content").hidden = true; $("editor-placeholder").hidden = false; $("save-file").disabled = true; $("reload-file").disabled = true; $("file-dirty").textContent = ""; }
 async function refresh() {
   state = await api("/api/state");
+  $("app-version").textContent = `/ v${state.version}`;
   $("config-location").textContent = state.configFile;
   $("host-count").textContent = state.inventory.hosts.length;
   $("config-warnings").textContent = state.inventory.warnings.join("\n");

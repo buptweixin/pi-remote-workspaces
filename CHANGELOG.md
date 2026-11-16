@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1 - 2026-11-16
+
+- Wait for asynchronous npm publication to become public before completing a release.
+- Verify that the registry archive matches the archive tested by the release workflow.
+- Display the installed package version in the dashboard instead of a hardcoded version.
+
 ## 0.1.0 - 2026-11-16
 
 - Discover SSH aliases dynamically from OpenSSH configuration and recursive includes.

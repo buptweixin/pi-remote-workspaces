@@ -79,21 +79,23 @@ See [npm Trusted Publishing](https://docs.npmjs.com/trusted-publishers/) and
 1. Update `CHANGELOG.md` with a `## X.Y.Z - YYYY-MM-DD` heading.
 2. Update `package.json` and `package-lock.json` to the same stable version.
 3. Commit the changes and wait for CI on `main` to pass.
-4. Create and push the matching version tag. For example, for a future `0.1.1`:
+4. Create and push the matching version tag. For example, for a future `0.1.2`:
 
 ```sh
 npm version patch --no-git-tag-version
 git add package.json package-lock.json CHANGELOG.md
-git commit -m "chore: release 0.1.1"
-git tag v0.1.1
+git commit -m "chore: release 0.1.2"
+git tag v0.1.2
 git push origin main
-git push origin v0.1.1
+git push origin v0.1.2
 ```
 
 The Publish workflow checks the tag against `package.json` and the changelog,
 runs tests, verifies a production installation of the exact tarball, and publishes
 that archive through OIDC. It then checks public npm metadata and creates a GitHub
-release with the tarball attached. A version already present on npm is not
+release with the tarball attached. The workflow waits for asynchronous registry
+processing and verifies the public archive's integrity against the tested archive.
+A version already present on npm is not
 published again. Only stable `vX.Y.Z` tags are supported by this workflow.
 
 To retry an existing release tag, use **Actions → Publish → Run workflow**, then

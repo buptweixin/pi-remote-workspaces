@@ -52,7 +52,7 @@ jobs:
         env:
           PACKAGE_NAME: ${{ steps.release.outputs.name }}
           PACKAGE_VERSION: ${{ steps.release.outputs.version }}
-        run: npm view "$PACKAGE_NAME@$PACKAGE_VERSION" name version dist.integrity --json
+        run: PACKAGE_ARCHIVE_DIR="$RUNNER_TEMP/pi-remote-release" node scripts/wait-for-package.mjs
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

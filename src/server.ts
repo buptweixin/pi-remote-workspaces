@@ -1,9 +1,12 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { ConfigStore, validateConfig, validateHost, type Workspace } from "./config.js";
 import { discoverHosts, resolveHost } from "./ssh-config.js";
 import { RemoteClient } from "./remote.js";
+
+const packageVersion: string = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 
 export interface Dashboard { url: string; close(): Promise<void> }
 export interface DashboardOptions { store?: ConfigStore; port?: number; client?: (workspace: Workspace, config: Awaited<ReturnType<ConfigStore["read"]>>) => RemoteClient }
@@ -56,7 +59,7 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Da
     try {
       const config = await store.read();
       if (url.pathname === "/api/state" && req.method === "GET") {
-        send(res, 200, { config, inventory: await discoverHosts(config), configFile: store.file }); return;
+        send(res, 200, { version: packageVersion, config, inventory: await discoverHosts(config), configFile: store.file }); return;
       }
       if (url.pathname === "/api/config" && req.method === "PUT") {
         const input = await body(req);
