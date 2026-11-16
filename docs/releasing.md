@@ -37,7 +37,7 @@ both CLI entry points, and loads the extension through pi's resource loader.
 For the initial `0.1.0` release, publish the verified archive:
 
 ```sh
-npm publish release-artifacts/arnowei-pi-remote-workspaces-0.1.0.tgz --access public
+npm publish ./release-artifacts/arnowei-pi-remote-workspaces-0.1.0.tgz --access public
 npm view @arnowei/pi-remote-workspaces@0.1.0 name version dist.integrity --json
 ```
 
