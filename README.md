@@ -85,6 +85,7 @@ The extension menus and dashboard currently use Simplified Chinese. Command name
 ```text
 /remote                  Open the configuration and workspace menu
 /remote add              Select an SSH host and add a workspace
+/remote remove my-app    Remove a saved workspace configuration
 /remote hosts            Reload SSH config and show aliases with their sources
 /remote use my-app-dev   Bind this session to a saved workspace
 /remote test             Check connectivity and Python/Git/ripgrep availability
@@ -167,6 +168,7 @@ Refreshing the host list rereads configuration files and their includes. Each SS
 node dist/cli.js hosts          # SSH aliases and source locations
 node dist/cli.js list           # Saved workspaces
 node dist/cli.js test my-app-dev
+node dist/cli.js remove my-app-dev
 node dist/cli.js --help
 ```
 
@@ -176,7 +178,7 @@ node dist/cli.js --help
 - The dashboard runs one-shot commands. It does not provide a PTY, persistent interactive terminal, language server, remote debugger, or editor syntax highlighting.
 - Files are limited to 8 MiB; directory listings to 5,000 entries. Dashboard command output is limited to 1 MiB. Search and Git output may be truncated. The dashboard edits UTF-8 text; files with consistent CRLF line endings retain CRLF when saved.
 - Cancellation and timeouts terminate the local SSH process group. Remote commands, background jobs, or detached processes may keep running. Use tmux or another remote process manager for long-running work that needs reliable lifecycle management.
-- Model calls, session storage, skills, and local project context remain on the machine running pi. The extension adds the remote root to the system prompt and asks the agent to inspect the remote `AGENTS.md`. Prefer separate sessions when switching machines or privilege levels.
+- Model calls, session storage, and skills remain on the machine running pi. When bound to a remote workspace, the extension sets the prompt working directory to the remote root and replaces local project context with remote `AGENTS.md` / `CLAUDE.md` instructions when present inside the bound root. Prefer separate sessions when switching machines or privilege levels.
 - The supported host is the current `@earendil-works/pi-coding-agent`. Older `@mariozechner/pi-coding-agent` releases have not been tested.
 
 ## Development and verification

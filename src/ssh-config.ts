@@ -1,11 +1,13 @@
-import { glob, readFile, realpath } from "node:fs/promises";
+import { glob, readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { validateHost, type RemoteConfig } from "./config.js";
 import { runProcess } from "./process.js";
 
 export interface SshHost { alias: string; source: string; line: number }
 export interface HostInventory { hosts: SshHost[]; files: string[]; warnings: string[] }
+
+const DISCOVERY_DIRECTIVE = /^\s*"?(?:host|include)"?(?:[\s=]|$)/i;
 
 /** Tokenizes only discovery directives; OpenSSH resolves all actual connection options. */
 export function tokens(line: string): string[] {
@@ -44,6 +46,7 @@ export async function discoverHosts(config: Pick<RemoteConfig, "sshConfigPath">,
     if (seen.has(canonical)) return;
     active.add(canonical); seen.add(canonical); inventory.files.push(canonical);
     for (const [index, line] of source.split(/\r?\n/).entries()) {
+      if (!DISCOVERY_DIRECTIVE.test(line)) continue;
       let parts: string[];
       try { parts = tokens(line); } catch (error) { inventory.warnings.push(`${file}:${index + 1}: ${(error as Error).message}`); continue; }
       const directive = parts.shift()?.toLowerCase();
@@ -52,7 +55,7 @@ export async function discoverHosts(config: Pick<RemoteConfig, "sshConfigPath">,
         if (!aliases.has(alias)) { aliases.add(alias); inventory.hosts.push({ alias, source: file, line: index + 1 }); }
       }
       if (directive === "include") for (const include of parts) {
-        const expanded = include.replace(/^~(?=\/)/, home).replace(/\$\{([^}]+)\}/g, (_, name: string) => process.env[name] ?? "");
+        const expanded = include.replace(/^~(?=\/|$)/, home).replace(/\$\{([^}]+)\}/g, (_, name: string) => process.env[name] ?? "");
         const pattern = isAbsolute(expanded) ? expanded : resolve(base, expanded);
         try {
           const matches: string[] = [];
@@ -71,6 +74,30 @@ export async function discoverHosts(config: Pick<RemoteConfig, "sshConfigPath">,
   }
   inventory.hosts.sort((a, b) => a.alias.localeCompare(b.alias));
   return inventory;
+}
+
+/** Fast fingerprint of active SSH config files so pooled workers rotate when configs change. */
+export async function sshConfigSignature(config: Pick<RemoteConfig, "sshConfigPath">, trackedFiles?: readonly string[], home = homedir(), systemConfig = "/etc/ssh/ssh_config"): Promise<{ signature: string; files: string[] }> {
+  const candidates = trackedFiles?.length
+    ? trackedFiles
+    : config.sshConfigPath ? [config.sshConfigPath] : [resolve(home, ".ssh/config"), systemConfig];
+  const parts: string[] = [];
+  const targets = [...new Set([...candidates, ...candidates.map(file => dirname(file))])];
+  for (const file of targets) {
+    try {
+      const info = await stat(file);
+      parts.push(`${file}:${info.ino}:${info.size}:${info.mtimeMs}`);
+    } catch {
+      parts.push(`${file}:missing`);
+    }
+  }
+  if (!trackedFiles?.length) {
+    try {
+      const inventory = await discoverHosts(config, home, systemConfig);
+      if (inventory.files.length) return sshConfigSignature(config, inventory.files, home, systemConfig);
+    } catch { /* Keep root-level stat signature. */ }
+  }
+  return { signature: parts.join("|"), files: [...candidates] };
 }
 
 export function sshArgs(config: RemoteConfig): string[] {

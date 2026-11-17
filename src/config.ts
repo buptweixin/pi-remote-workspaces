@@ -1,7 +1,7 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, resolve } from "node:path";
-import { randomUUID } from "node:crypto";
+import { dirname, posix, resolve } from "node:path";
+import { randomBytes, randomUUID } from "node:crypto";
 import lockfile from "proper-lockfile";
 
 export interface Workspace { id: string; name: string; host: string; path: string }
@@ -16,6 +16,21 @@ export const defaults = (): RemoteConfig => ({ version: 1, connectTimeoutSeconds
 export function agentDir(): string { return process.env.PI_CODING_AGENT_DIR || resolve(homedir(), ".pi/agent"); }
 export function configFile(): string { return process.env.PI_REMOTE_CONFIG || resolve(agentDir(), "remote.json"); }
 
+export function slugifyWorkspaceId(host: string, path: string, name?: string, existingIds: Iterable<string> = []): string {
+  const taken = new Set(existingIds);
+  const hostSlug = host.replace(/^.*@/, "").replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "").toLowerCase();
+  const leaf = posix.basename(path.replace(/\/+$/, "")).replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "").toLowerCase();
+  const named = (name ?? "").replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "").toLowerCase();
+  const raw = (named && named !== `${hostSlug}-${leaf}` ? named : [hostSlug, leaf].filter(Boolean).join("-")).slice(0, 48).replace(/-+$/g, "");
+  const base = raw || `ws-${randomBytes(4).toString("hex")}`;
+  if (!taken.has(base)) return base;
+  for (let suffix = 2; suffix < 10_000; suffix++) {
+    const candidate = `${base.slice(0, 72)}-${suffix}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+  return randomBytes(6).toString("hex");
+}
+
 export function validateHost(host: unknown): asserts host is string {
   if (typeof host !== "string" || !/^[a-zA-Z0-9_][a-zA-Z0-9_.@:\-]*$/.test(host) || host.length > 255) {
     throw new Error("Host must be a concrete SSH alias or user@hostname (no patterns, spaces or options)");
@@ -28,7 +43,8 @@ export function validateConfig(value: unknown): RemoteConfig {
   for (const field of ["connectTimeoutSeconds", "commandTimeoutSeconds"] as const) {
     if (!Number.isInteger(v[field]) || v[field] < 1 || v[field] > 3600) throw new Error(`${field} must be between 1 and 3600`);
   }
-  if (v.sshConfigPath !== undefined && (typeof v.sshConfigPath !== "string" || !v.sshConfigPath.trim() || !v.sshConfigPath.startsWith("/") || /[\0\r\n]/.test(v.sshConfigPath))) {
+  const sshConfigPath = typeof v.sshConfigPath === "string" ? v.sshConfigPath.trim() : v.sshConfigPath;
+  if (sshConfigPath !== undefined && (typeof sshConfigPath !== "string" || !sshConfigPath || !sshConfigPath.startsWith("/") || /[\0\r\n]/.test(sshConfigPath))) {
     throw new Error("sshConfigPath must be an absolute path, or omitted for the system default");
   }
   const ids = new Set<string>();
@@ -39,7 +55,7 @@ export function validateConfig(value: unknown): RemoteConfig {
     if (typeof w.name !== "string" || !w.name.trim() || w.name.length > 120) throw new Error("Workspace name is required (max 120 characters)");
     if (typeof w.path !== "string" || !/^(\/|~(?:\/|$))/.test(w.path) || /[\0\r\n]/.test(w.path)) throw new Error("Remote path must be absolute or start with ~/ (no control characters)");
   }
-  return { version: 1, sshConfigPath: v.sshConfigPath, connectTimeoutSeconds: v.connectTimeoutSeconds, commandTimeoutSeconds: v.commandTimeoutSeconds, workspaces: v.workspaces.map(w => ({ id: w.id, name: w.name, host: w.host, path: w.path })) };
+  return { version: 1, sshConfigPath, connectTimeoutSeconds: v.connectTimeoutSeconds, commandTimeoutSeconds: v.commandTimeoutSeconds, workspaces: v.workspaces.map(w => ({ id: w.id, name: w.name.trim(), host: w.host, path: w.path })) };
 }
 export class ConfigStore {
   constructor(readonly file = configFile()) {}
@@ -58,7 +74,7 @@ export class ConfigStore {
       await rename(temporary, this.file);
       return config;
     } finally {
-      if (temporary) { const { rm } = await import("node:fs/promises"); await rm(temporary, { force: true }); }
+      if (temporary) await rm(temporary, { force: true });
       await release();
     }
   }

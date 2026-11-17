@@ -11,31 +11,47 @@ export interface RunOptions {
 
 export interface RunResult { stdout: Buffer; stderr: Buffer; exitCode: number }
 
+export class ProcessAbortError extends Error {
+  constructor(cause?: unknown) { super("Operation aborted", { cause }); this.name = "ProcessAbortError"; }
+}
+export class ProcessTimeoutError extends Error {
+  constructor(readonly timeoutMs: number) { super(`Operation timed out after ${timeoutMs} ms`); this.name = "ProcessTimeoutError"; }
+}
+
+const MAX_STDERR_BYTES = 65_536;
+
+export function killProcessGroup(pid: number | undefined, killChild: (signal: NodeJS.Signals) => void): NodeJS.Timeout {
+  const send = (signal: NodeJS.Signals) => {
+    try {
+      if (process.platform !== "win32" && pid) process.kill(-pid, signal);
+      else killChild(signal);
+    } catch { /* Already exited. */ }
+  };
+  send("SIGTERM");
+  const escalation = setTimeout(() => send("SIGKILL"), 500);
+  escalation.unref();
+  return escalation;
+}
+
 /** No local shell: config aliases and arguments never become shell source. */
 export function runProcess(program: string, args: string[], options: RunOptions = {}): Promise<RunResult> {
-  options.signal?.throwIfAborted();
+  if (options.signal?.aborted) return Promise.reject(new ProcessAbortError(options.signal.reason));
   return new Promise((resolve, reject) => {
     const child = spawn(program, args, { stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
     const stdout: Buffer[] = [];
-    let stderr = Buffer.alloc(0);
+    const stderrChunks: Buffer[] = [];
+    let stderrBytes = 0;
     let size = 0;
     let failure: Error | undefined;
     let escalation: NodeJS.Timeout | undefined;
+    const timeoutMs = options.timeoutMs ?? 30_000;
     const stop = (error: Error) => {
       if (failure) return;
       failure = error;
-      const kill = (signal: NodeJS.Signals) => {
-        try {
-          if (process.platform !== "win32" && child.pid) process.kill(-child.pid, signal);
-          else child.kill(signal);
-        } catch { /* Already exited. */ }
-      };
-      kill("SIGTERM");
-      escalation = setTimeout(() => kill("SIGKILL"), 500);
-      escalation.unref();
+      escalation = killProcessGroup(child.pid, signal => child.kill(signal));
     };
-    const abort = () => stop(new Error("Operation aborted", { cause: options.signal?.reason }));
-    const timer = setTimeout(() => stop(new Error(`Operation timed out after ${options.timeoutMs ?? 30_000} ms`)), options.timeoutMs ?? 30_000);
+    const abort = () => stop(new ProcessAbortError(options.signal?.reason));
+    const timer = setTimeout(() => stop(new ProcessTimeoutError(timeoutMs)), timeoutMs);
     const clean = () => {
       clearTimeout(timer);
       if (escalation) clearTimeout(escalation);
@@ -53,7 +69,11 @@ export function runProcess(program: string, args: string[], options: RunOptions 
     });
     child.stderr.on("data", (data: Buffer) => {
       options.onData?.(data);
-      stderr = Buffer.concat([stderr, data]).subarray(-65_536);
+      stderrChunks.push(data);
+      stderrBytes += data.length;
+      while (stderrChunks.length > 1 && stderrBytes - stderrChunks[0]!.length >= MAX_STDERR_BYTES) {
+        stderrBytes -= stderrChunks.shift()!.length;
+      }
     });
     child.stdin.on("error", (error: NodeJS.ErrnoException) => {
       if (error.code !== "EPIPE") stop(error);
@@ -63,7 +83,7 @@ export function runProcess(program: string, args: string[], options: RunOptions 
       clean();
       if (failure) reject(failure);
       else if (signal) reject(new Error(`Process terminated by ${signal}`));
-      else resolve({ stdout: Buffer.concat(stdout), stderr, exitCode: code ?? 255 });
+      else resolve({ stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderrChunks).subarray(-MAX_STDERR_BYTES), exitCode: code ?? 255 });
     });
     child.stdin.end(options.input);
   });

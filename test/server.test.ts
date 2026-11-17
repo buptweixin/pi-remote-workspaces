@@ -40,6 +40,18 @@ test("dashboard protects its API and completes workspace/file configuration flow
   assert.equal(response.status, 400);
   response = await request("/api/config", "PUT", { connectTimeoutSeconds: 20, commandTimeoutSeconds: 180 });
   assert.equal(response.status, 200); assert.equal((await store.read()).workspaces.length, 1);
+  // Create-only write (etag: null) succeeds for new files and rejects existing files.
+  response = await request("/api/workspaces/demo/write", "POST", { path: "brand-new.txt", content: "created", etag: null });
+  assert.equal(response.status, 200);
+  response = await request("/api/workspaces/demo/write", "POST", { path: "brand-new.txt", content: "overwrite", etag: null });
+  assert.equal(response.status, 400); assert.match((await response.json()).error, /already exists/);
+  // Interleaved stdout/stderr order is preserved in /exec.
+  const execRes = await (await request("/api/workspaces/demo/exec", "POST", { command: "printf '1-out\\n'; sleep 0.05; printf '2-err\\n' >&2; sleep 0.05; printf '3-out\\n'" })).json();
+  assert.equal(execRes.text, "1-out\n2-err\n3-out\n");
+  // Auto-slug workspace ID when id is omitted.
+  const autoSlug = await (await request("/api/workspaces", "POST", { name: "Staging API", host: "fixture", path: root })).json();
+  assert.equal(autoSlug.id, "staging-api");
+  assert.equal((await request("/api/workspaces/staging-api", "DELETE")).status, 200);
   assert.equal((await request("/api/workspaces/demo", "DELETE")).status, 200);
   assert.equal((await store.read()).workspaces.length, 0);
 });

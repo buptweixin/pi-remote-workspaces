@@ -3,9 +3,11 @@ import test from "node:test";
 import { mkdir, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { runProcess } from "../src/process.js";
-import { createRemoteTools } from "../src/tools.js";
+import { RemoteClient } from "../src/remote.js";
+import { defaults } from "../src/config.js";
+import { createRemoteTools, remotePath } from "../src/tools.js";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
-import { temporary, clientFor } from "./helpers.js";
+import { temporary, clientFor, localTransport, workspace } from "./helpers.js";
 
 test("actual remote helper reads/writes quoted paths, preserves modes and detects conflicts", async t => {
   const dir = await temporary(t), root = join(dir, "project's $(not-a-command)");
@@ -67,4 +69,74 @@ test("SSH process execution enforces cancellation, timeout and output bounds", a
   setTimeout(() => controller.abort(), 20);
   await assert.rejects(pending, /aborted/);
   await assert.rejects(runProcess("/bin/sh", ["-c", "printf 123456789"], { maxBytes: 5 }), /size limit/);
+});
+
+test("remote tools minimize SSH round-trips, handle symlinks/images/@~ paths, and preserve partial bash output on timeout", async t => {
+  const dir = await temporary(t), root = join(dir, "workspace");
+  await mkdir(join(root, "sub/real-dir"), { recursive: true });
+  await writeFile(join(dir, "outside.txt"), "secret");
+  for (let i = 0; i < 12; i++) await writeFile(join(root, `file-${i}.txt`), `line ${i}\n`);
+  await symlink(join(root, "sub/real-dir"), join(root, "linked-dir"));
+  await symlink(join(dir, "outside.txt"), join(root, "escaped-link"));
+  // Minimal valid 1x1 PNG saved with a non-image extension to verify magic-byte sniffing.
+  const pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+  await writeFile(join(root, "image.bin"), Buffer.from(pngBase64, "base64"));
+
+  let rpcCalls = 0;
+  const countingClient = new RemoteClient(workspace(root), defaults(), async (prog, args, opts) => {
+    rpcCalls++;
+    return localTransport(prog, args, opts);
+  });
+  const probe = await countingClient.probe();
+  const tools = createRemoteTools(countingClient, probe);
+  const ctx = { cwd: "/wrong/local/cwd" } as ExtensionToolContext;
+
+  assert.equal(remotePath("@~/project/file.ts", "/remote/home"), "/remote/home/project/file.ts");
+
+  rpcCalls = 0;
+  const lsResult = await tools.ls!.execute("ls-1", {}, undefined, undefined, ctx);
+  assert.equal(rpcCalls, 1, "ls should complete in a single SSH RPC regardless of entry count");
+  const lsText = JSON.stringify(lsResult.content);
+  assert.match(lsText, /linked-dir\//);
+  assert.doesNotMatch(lsText, /escaped-link/);
+
+  rpcCalls = 0;
+  const imgResult = await tools.read!.execute("r-img", { path: "image.bin" }, undefined, undefined, ctx);
+  assert.equal(rpcCalls, 1, "read should complete in a single SSH RPC including image sniffing");
+  assert.ok(imgResult.content.some((block: { type: string }) => block.type === "image"));
+
+  rpcCalls = 0;
+  await tools.write!.execute("w-1", { path: "deep/nested/created.txt", content: "alpha\nbeta\n" }, undefined, undefined, ctx);
+  assert.equal(rpcCalls, 1, "write should create parent directories and write in a single SSH RPC");
+
+  rpcCalls = 0;
+  await tools.edit!.execute("e-1", { path: "deep/nested/created.txt", edits: [{ oldText: "alpha", newText: "ALPHA" }] }, undefined, undefined, ctx);
+  assert.equal(rpcCalls, 2, "edit should use exactly 2 SSH RPCs (preflight read + conflict-checked write)");
+
+  if (probe.ripgrep) {
+    await writeFile(join(root, "sub/long.ts"), `const marker = "${"x".repeat(700)}";\nconst second = "marker";\n`);
+    rpcCalls = 0;
+    const subFind = await tools.find!.execute("f-sub", { path: "sub", pattern: "./*.ts" }, undefined, undefined, ctx);
+    assert.equal(rpcCalls, 1, "find should complete in a single SSH RPC");
+    assert.match(JSON.stringify(subFind.content), /long\.ts/);
+
+    const grepRes = await tools.grep!.execute("g-sub", { path: "sub", pattern: "marker", limit: 1, context: 1 }, undefined, undefined, ctx);
+    const grepText = (grepRes.content[0] as { text: string }).text;
+    assert.match(grepText, /^long\.ts:1:/m);
+    assert.match(grepText, /\[truncated\]/);
+    assert.equal(grepRes.details?.matchLimitReached, 1);
+    assert.equal(grepRes.details?.linesTruncated, true);
+  }
+
+  await assert.rejects(
+    tools.bash!.execute("b-timeout", { command: "printf 'streamed-before-timeout\\n'; sleep 3", timeout: 0.1 }, undefined, undefined, ctx),
+    /streamed-before-timeout[\s\S]*Command timed out after 0\.1 seconds/,
+  );
+
+  // Verify sentinel framing tolerates noisy SSH login banners on stdout.
+  const noisyClient = new RemoteClient(workspace(root), defaults(), async (prog, args, opts) => {
+    const res = await localTransport(prog, args, opts);
+    return { ...res, stdout: Buffer.concat([Buffer.from("Welcome to Corp Bastion!\n"), res.stdout]) };
+  });
+  assert.equal((await noisyClient.probe()).root, probe.root);
 });

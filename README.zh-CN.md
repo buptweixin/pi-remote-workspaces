@@ -85,6 +85,7 @@ pi 的包清单在 `package.json` 的 `pi.extensions` 字段中，入口为 `src
 ```text
 /remote                  配置与工作区选择菜单
 /remote add              从 SSH config 选择主机并添加工作区
+/remote remove my-app    删除已保存的工作区配置
 /remote hosts            重新读取 SSH config，显示主机及来源
 /remote use my-app-dev   绑定已保存的工作区
 /remote test             检查连接及 Python/Git/ripgrep 可用性
@@ -165,6 +166,7 @@ node dist/cli.js serve --port 30142
 node dist/cli.js hosts          # 动态 SSH 主机列表及来源
 node dist/cli.js list           # 已保存的工作区
 node dist/cli.js test my-app-dev
+node dist/cli.js remove my-app-dev
 node dist/cli.js --help
 ```
 
@@ -174,7 +176,7 @@ node dist/cli.js --help
 - 浏览器提供一次性命令执行，暂不提供 PTY、持久交互终端、语言服务、远程调试或编辑器语法高亮。
 - 单个文件最大 8 MiB；目录最多 5000 项。浏览器命令输出最大 1 MiB，搜索和 Git 输出有截断限制。浏览器仅编辑 UTF-8 文本；统一 CRLF 文件在保存时保留 CRLF。
 - 取消与超时会终止本机 SSH 进程组；远端命令、后台进程或自行脱离终端的进程可能继续运行。需要可靠的长任务管理时，请在远端使用 tmux 或其他进程管理器。
-- agent 的模型调用、会话存储、skills 和本地项目上下文仍在 pi 所在机器上；扩展在系统提示中标出远程根目录，并要求先查看远程 `AGENTS.md`。不同机器或权限模式之间切换，建议使用独立会话。
+- agent 的模型调用、会话存储和 skills 仍在 pi 所在机器上；绑定远程工作区后，扩展会将系统提示中的工作目录设为远程根目录，并用远程根目录内的 `AGENTS.md` / `CLAUDE.md` 替换本地项目上下文。不同机器或权限模式之间切换，建议使用独立会话。
 - 当前正式兼容目标为新版 `@earendil-works/pi-coding-agent`；尚未验证旧版 `@mariozechner/pi-coding-agent`。
 
 ## 开发与验证

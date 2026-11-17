@@ -8,7 +8,7 @@ async function main(args = process.argv.slice(2)) {
   const [command = "serve", ...rest] = args;
   const store = new ConfigStore();
   if (command === "help" || command === "--help" || command === "-h") {
-    console.log("pi-remote serve [--port N]\npi-remote hosts\npi-remote list\npi-remote test <workspace-id>\n\nPI_REMOTE_CONFIG selects the config file. Default: ~/.pi/agent/remote.json"); return;
+    console.log("pi-remote serve [--port N]\npi-remote hosts\npi-remote list\npi-remote test <workspace-id>\npi-remote remove <workspace-id>\n\nPI_REMOTE_CONFIG selects the config file. Default: ~/.pi/agent/remote.json"); return;
   }
   if (command === "serve") {
     if (rest.length && (rest.length !== 2 || rest[0] !== "--port")) throw new Error("Usage: pi-remote serve [--port N]");
@@ -26,6 +26,12 @@ async function main(args = process.argv.slice(2)) {
     const workspace = config.workspaces.find(w => w.id === rest[0]);
     if (!workspace) throw new Error(`Unknown workspace: ${rest[0]}`);
     console.log(JSON.stringify(await new RemoteClient(workspace, config).probe(), null, 2)); return;
+  }
+  if ((command === "remove" || command === "rm") && rest.length === 1) {
+    const target = config.workspaces.find(w => w.id === rest[0]);
+    if (!target) throw new Error(`Unknown workspace: ${rest[0]}`);
+    await store.update(current => ({ ...current, workspaces: current.workspaces.filter(w => w.id !== target.id) }));
+    console.log(`Removed workspace: ${target.id}`); return;
   }
   throw new Error("Unknown command. Run pi-remote --help");
 }

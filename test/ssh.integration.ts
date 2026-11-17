@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createRemoteTools } from "../src/tools.js";
+import { RemoteClient, RemotePool } from "../src/remote.js";
 import { discoverHosts } from "../src/ssh-config.js";
 import { sshFixture } from "./ssh-fixture.js";
 import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager, type ExtensionToolContext } from "@earendil-works/pi-coding-agent";
@@ -29,7 +30,10 @@ test("real OpenSSH transport, actual SDK loading, session binding and isolation"
     const { session: result } = await createAgentSession({ cwd: fixture.root, agentDir: join(fixture.root, "agent"), settingsManager, resourceLoader: loader, sessionManager: manager });
     if (remoteId) result.extensionRunner.setFlagValue("remote", remoteId);
     await result.bindExtensions({ mode: "rpc", uiContext: { ...result.extensionRunner.getUIContext(), notify: message => notices.push(message), setStatus: () => {}, setWidget: () => {} } });
-    t.after(() => result.dispose());
+    t.after(async () => {
+      await result.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+      result.dispose();
+    });
     return result;
   }
   const first = await session();
@@ -61,4 +65,55 @@ test("real OpenSSH transport, actual SDK loading, session binding and isolation"
   await resumed.prompt("/remote local");
   await resumed.prompt("/remote status");
   assert.match(notices.at(-1)!, /本地/);
+
+  // Verify Keep-Alive RemotePool reuses warm SSH Python workers and rotates on config change.
+  const pool = new RemotePool();
+  t.after(() => pool.close());
+  const pooledClient = new RemoteClient(fixture.config.workspaces[0]!, fixture.config, undefined, pool);
+  await pooledClient.probe();
+  assert.equal(pool.size, 1);
+  for (let i = 0; i < 5; i++) {
+    const content = await pooledClient.read("actual-ssh.txt");
+    assert.equal(Buffer.from(content.data, "base64").toString(), "SSH transport works\n");
+  }
+  assert.equal(pool.size, 1, "consecutive RPCs should reuse the single warm SSH worker");
+
+  // Verify remote AGENTS.md replaces unrelated local AGENTS.md in system prompt and /remote completions work.
+  const localDir = join(fixture.root, "local-cwd"), remoteDir = join(fixture.root, "remote-repo");
+  await mkdir(localDir, { recursive: true });
+  await mkdir(remoteDir, { recursive: true });
+  await writeFile(join(localDir, "AGENTS.md"), "LOCAL_ONLY_SECRET_CONTEXT");
+  await writeFile(join(remoteDir, "AGENTS.md"), "REMOTE_PROJECT_INSTRUCTIONS");
+  await fixture.store.update(current => ({
+    ...current,
+    workspaces: [...current.workspaces, { id: "remote-repo", name: "Remote Repo", host: "fixture", path: remoteDir }],
+  }));
+  const settingsManager = SettingsManager.inMemory({ defaultTools: ["read", "write", "edit", "bash", "grep", "find", "ls"] });
+  const loader = new DefaultResourceLoader({ cwd: localDir, agentDir: join(fixture.root, "agent"), settingsManager, noSkills: true, noPromptTemplates: true, noThemes: true, additionalExtensionPaths: [join(process.cwd(), "src/extension.ts")] });
+  await loader.reload();
+  const { session: isolated } = await createAgentSession({ cwd: localDir, agentDir: join(fixture.root, "agent"), settingsManager, resourceLoader: loader, sessionManager: SessionManager.inMemory(localDir) });
+  await isolated.bindExtensions({ mode: "rpc", uiContext: { ...isolated.extensionRunner.getUIContext(), notify: message => notices.push(message), setStatus: () => {}, setWidget: () => {} } });
+  t.after(() => isolated.dispose());
+
+  const remoteCmd = isolated.extensionRunner.getCommand("remote")!;
+  const completions = await remoteCmd.getArgumentCompletions!("use rem");
+  assert.ok(completions?.some(item => item.value === "use remote-repo"));
+
+  await isolated.prompt("/remote use remote-repo");
+  const built = await isolated.extensionRunner.emitBeforeAgentStart(
+    { type: "before_agent_start", messageType: "user", prompt: "inspect" } as any,
+    isolated.extensionRunner.createCommandContext().getSystemPromptOptions(),
+  );
+  assert.equal(built.systemPromptOptions.cwd, remoteDir);
+  assert.ok(built.systemPromptOptions.contextFiles.some(f => f.content.includes("REMOTE_PROJECT_INSTRUCTIONS")));
+  assert.ok(!built.systemPromptOptions.contextFiles.some(f => f.content.includes("LOCAL_ONLY_SECRET_CONTEXT")));
+
+  await isolated.prompt("/remote remove remote-repo");
+  assert.ok(!(await fixture.store.read()).workspaces.some(w => w.id === "remote-repo"));
+  await Promise.all([
+    pool.close(),
+    isolated.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }),
+    first.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }),
+    resumed.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }),
+  ]);
 });

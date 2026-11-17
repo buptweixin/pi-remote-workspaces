@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { ConfigStore, defaults, validateConfig, validateHost } from "../src/config.js";
+import { ConfigStore, defaults, slugifyWorkspaceId, validateConfig, validateHost } from "../src/config.js";
 import { discoverHosts, resolveHost, tokens } from "../src/ssh-config.js";
 import { temporary, workspace } from "./helpers.js";
 
@@ -51,4 +51,19 @@ test("host and workspace validation reject SSH options, shell metacharacters and
   for (const host of ["-oProxyCommand=anything", "host;touch /tmp/oops", "*.example", "host\nother", "user@host $(id)"]) assert.throws(() => validateHost(host));
   validateHost("user@2001:db8::1");
   assert.throws(() => validateConfig({ ...defaults(), workspaces: [{ ...workspace("relative/path") }] }), /Remote path/);
+  assert.equal(slugifyWorkspaceId("user@dev.example.com", "~/projects/my-app"), "dev-example-com-my-app");
+  assert.equal(slugifyWorkspaceId("dev", "~/app", "My Service", ["my-service"]), "my-service-2");
+});
+
+test("SSH discovery ignores complex shell quotes in ProxyCommand and Match lines", async t => {
+  const home = await temporary(t), file = join(home, "ssh_config");
+  await writeFile(file, [
+    "Host JumpBox",
+    '  ProxyCommand sh -c \'exec nc %h %p\' \\',
+    "Match host *.internal exec 'test \"$ENV\" = prod'",
+    "Host clean-host",
+  ].join("\n"));
+  const inventory = await discoverHosts({ sshConfigPath: file }, home);
+  assert.deepEqual(inventory.hosts.map(h => h.alias), ["clean-host", "JumpBox"].sort((a, b) => a.localeCompare(b)));
+  assert.deepEqual(inventory.warnings, []);
 });

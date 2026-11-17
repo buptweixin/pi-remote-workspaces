@@ -1,12 +1,11 @@
 "use strict";
 const $ = id => document.getElementById(id);
 const fragment = new URLSearchParams(location.hash.slice(1));
-if (fragment.has("token")) {
-  sessionStorage.setItem("pi-remote-token", fragment.get("token"));
-  history.replaceState(null, "", location.pathname);
-}
+const initialWorkspaceId = fragment.get("workspace") || "";
+if (fragment.has("token")) sessionStorage.setItem("pi-remote-token", fragment.get("token"));
+if (location.hash) history.replaceState(null, "", location.pathname + location.search);
 const token = sessionStorage.getItem("pi-remote-token") || "";
-let state, selected, directory = ".", file, editingId, commandController, toastTimer, fileReadSequence = 0;
+let state, selected, directory = ".", file, editingId, commandController, resolveController, resolveTimer, toastTimer, fileReadSequence = 0;
 const dirty = () => file && $("file-content").value !== file.saved;
 function canLeave() { return !dirty() || confirm("文件有未保存的修改，确定放弃这些修改吗？"); }
 function toast(message, error = false) {
@@ -15,14 +14,29 @@ function toast(message, error = false) {
 }
 async function api(path, method = "GET", data, signal) {
   const response = await fetch(path, { method, signal, headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" }, ...(data === undefined ? {} : { body: JSON.stringify(data) }) });
-  const result = await response.json();
+  const raw = await response.text();
+  let result = {};
+  if (raw) {
+    try { result = JSON.parse(raw); }
+    catch { throw new Error(`HTTP ${response.status}: invalid server response`); }
+  }
   if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
   return result;
 }
 const perform = action => async event => { event?.preventDefault(); try { await action(event); } catch (error) { toast(error.message, true); } };
 const endpoint = action => `/api/workspaces/${encodeURIComponent(selected.id)}/${action}`;
 function node(tag, text, className) { const item = document.createElement(tag); if (text !== undefined) item.textContent = text; if (className) item.className = className; return item; }
-function clearFile() { fileReadSequence++; file = undefined; $("file-name").textContent = "选择文件以查看或编辑"; $("file-content").hidden = true; $("editor-placeholder").hidden = false; $("save-file").disabled = true; $("reload-file").disabled = true; $("file-dirty").textContent = ""; }
+function syncActiveFileRow() {
+  for (const row of $("file-list").querySelectorAll(".file-row")) {
+    row.classList.toggle("active", !!file && row.dataset.path === file.path);
+  }
+}
+function clearFile() {
+  fileReadSequence++; file = undefined;
+  $("file-name").textContent = "选择文件以查看或编辑"; $("file-content").hidden = true; $("editor-placeholder").hidden = false;
+  $("save-file").disabled = true; $("reload-file").disabled = true; $("file-dirty").textContent = "";
+  syncActiveFileRow();
+}
 async function refresh() {
   state = await api("/api/state");
   $("app-version").textContent = `/ v${state.version}`;
@@ -65,10 +79,11 @@ async function listFiles() {
   $("directory-path").textContent = path === "." ? "/" : path; $("directory-path").title = path;
   $("parent-directory").disabled = directory === ".";
   $("file-list").replaceChildren(...entries.map(entry => {
-    const button = node("button", undefined, "file-row");
+    const target = directory === "." ? entry.name : `${directory}/${entry.name}`;
+    const button = node("button", undefined, `file-row${file?.path === target ? " active" : ""}`);
+    button.dataset.path = target;
     button.append(node("span", entry.directory ? "▱" : entry.symlink ? "↗" : "·", "file-icon"), node("span", entry.name));
     button.onclick = perform(async () => {
-      const target = directory === "." ? entry.name : `${directory}/${entry.name}`;
       if (entry.directory) { directory = target; await listFiles(); }
       else await openFile(target);
     }); return button;
@@ -84,21 +99,46 @@ async function openFile(path, force = false) {
   const bytes = Uint8Array.from(atob(result.data), c => c.charCodeAt(0));
   const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
   if (text.includes("\0")) throw new Error("此文件是二进制文件，请通过 pi 的 read 工具查看。");
+  // Preserve CRLF only when all line endings in the original file consistently use CRLF.
+  const crlf = text.includes("\r\n") && !text.replaceAll("\r\n", "").includes("\n");
   $("file-content").value = text;
-  file = { path, etag: result.etag, saved: $("file-content").value, crlf: text.includes("\r\n") };
+  file = { path, etag: result.etag, saved: $("file-content").value, crlf };
   $("file-name").textContent = path; $("file-name").title = path;
   $("file-content").hidden = false; $("editor-placeholder").hidden = true; $("reload-file").disabled = false;
+  syncActiveFileRow();
   updateDirty();
 }
 function updateDirty() { $("file-dirty").textContent = dirty() ? "未保存" : ""; $("save-file").disabled = !dirty(); }
+function previewHost(rawHost) {
+  clearTimeout(resolveTimer);
+  resolveController?.abort();
+  const host = (rawHost || "").trim();
+  if (!host) { $("host-preview").textContent = ""; return; }
+  resolveTimer = setTimeout(async () => {
+    const controller = new AbortController();
+    resolveController = controller;
+    try {
+      const resolved = await api("/api/resolve", "POST", { host }, controller.signal);
+      if (controller.signal.aborted) return;
+      const user = resolved.user?.[0], hostname = resolved.hostname?.[0], port = resolved.port?.[0], jump = resolved.proxyjump?.[0];
+      const target = `${user ? `${user}@` : ""}${hostname || host}${port && port !== "22" ? `:${port}` : ""}`;
+      $("host-preview").textContent = `生效目标：${target}${jump && jump !== "none" ? ` · ProxyJump ${jump}` : ""}`;
+    } catch {
+      if (!controller.signal.aborted) $("host-preview").textContent = "";
+    }
+  }, 220);
+}
 function openWorkspace(workspace, host = "") {
   editingId = workspace?.id; const form = $("workspace-form"); form.reset();
   for (const name of ["name", "host", "path", "id"]) form.elements.namedItem(name).value = workspace?.[name] || (name === "host" ? host : "");
   form.elements.namedItem("id").disabled = !!workspace;
   $("dialog-title").textContent = workspace ? "编辑远程工作区" : "添加远程工作区";
   $("workspace-error").textContent = ""; $("delete-workspace").hidden = !workspace;
+  $("host-preview").textContent = "";
+  previewHost(form.elements.namedItem("host").value);
   $("workspace-dialog").showModal();
 }
+$("workspace-form").elements.namedItem("host").addEventListener("input", event => previewHost(event.target.value));
 for (const id of ["add-workspace", "add-empty", "welcome-add"]) $(id).onclick = () => openWorkspace();
 $("edit-workspace").onclick = () => openWorkspace(selected);
 for (const button of document.querySelectorAll("[data-close]")) button.onclick = () => $(button.dataset.close).close();
@@ -145,8 +185,26 @@ for (const button of document.querySelectorAll("[data-tab]")) button.onclick = (
   for (const other of document.querySelectorAll("[data-tab]")) { other.classList.toggle("active", other === button); $(`panel-${other.dataset.tab}`).hidden = other !== button; }
 };
 $("parent-directory").onclick = perform(async () => { directory = directory.includes("/") ? directory.slice(0, directory.lastIndexOf("/")) : "."; await listFiles(); });
+$("new-file").onclick = perform(async () => {
+  if (!canLeave()) return;
+  const input = prompt(`在 ${directory === "." ? "工作区根目录" : directory} 下新建文件路径：`);
+  const rel = (input || "").trim().replace(/^\/+/, "");
+  if (!rel) return;
+  const target = directory === "." ? rel : `${directory}/${rel}`;
+  await api(endpoint("write"), "POST", { path: target, etag: null, content: "" });
+  await listFiles();
+  await openFile(target, true);
+  $("file-content").focus();
+  toast(`已创建 ${target}`);
+});
 $("refresh-files").onclick = perform(listFiles);
 $("file-content").oninput = updateDirty;
+$("file-content").addEventListener("keydown", event => {
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+    event.preventDefault();
+    if (!$("save-file").disabled) $("save-file").click();
+  }
+});
 $("reload-file").onclick = perform(async () => { if (canLeave()) await openFile(file.path, true); });
 $("save-file").onclick = perform(async () => {
   const currentFile = file, id = selected.id, snapshot = $("file-content").value;
@@ -157,15 +215,34 @@ $("save-file").onclick = perform(async () => {
     if (selected?.id === id && file === currentFile) { file.etag = result.etag; file.saved = snapshot; toast("文件已保存到远程主机"); }
   } finally { updateDirty(); }
 });
+function syncSearchOptions() {
+  const isFind = $("search-mode").value === "find";
+  $("search-literal").disabled = isFind;
+  $("search-ignore-case").disabled = isFind;
+}
+$("search-mode").onchange = syncSearchOptions;
+syncSearchOptions();
 $("search-form").onsubmit = perform(async () => {
   const id = selected.id; $("search-output").textContent = "正在搜索…";
-  const result = await api(endpoint("search"), "POST", { pattern: $("search-pattern").value, mode: $("search-mode").value, literal: $("search-literal").checked, limit: 200 });
+  const result = await api(endpoint("search"), "POST", {
+    pattern: $("search-pattern").value,
+    mode: $("search-mode").value,
+    literal: $("search-literal").checked,
+    ignoreCase: $("search-ignore-case").checked,
+    limit: 200,
+  });
   if (selected?.id === id) $("search-output").textContent = (result.text || "没有匹配结果") + (result.truncated ? "\n[结果已截断，请缩小搜索范围]" : "");
 });
 for (const button of document.querySelectorAll("[data-git]")) button.onclick = perform(async () => {
   const id = selected.id; $("git-output").textContent = "正在读取 Git…";
   const result = await api(endpoint("git"), "POST", { action: button.dataset.git });
   if (selected?.id === id) $("git-output").textContent = (result.text || "没有改动") + (result.truncated ? "\n[输出已截断]" : "");
+});
+$("command-input").addEventListener("keydown", event => {
+  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+    event.preventDefault();
+    if (!$("run-command").disabled) $("command-form").requestSubmit();
+  }
 });
 $("command-form").onsubmit = perform(async () => {
   if (commandController) return;
@@ -180,4 +257,8 @@ $("command-form").onsubmit = perform(async () => {
 });
 $("cancel-command").onclick = () => commandController?.abort();
 window.addEventListener("beforeunload", event => { if (dirty()) { event.preventDefault(); event.returnValue = ""; } });
-perform(async () => { await refresh(); if (state.config.workspaces[0]) await selectWorkspace(state.config.workspaces[0]); })();
+perform(async () => {
+  await refresh();
+  const initial = (initialWorkspaceId && state.config.workspaces.find(w => w.id === initialWorkspaceId)) || state.config.workspaces[0];
+  if (initial) await selectWorkspace(initial);
+})();
