@@ -2,7 +2,7 @@
 
 Pi Remote's original code is covered by the root [MIT License](LICENSE).
 Third-party components retain their own licenses. This notice describes the
-current `0.1.1` source tree and locked runtime dependencies; review it when
+current `0.2.0` source tree and locked runtime dependencies; review it when
 dependencies or distribution formats change.
 
 ## Pi SSH extension example

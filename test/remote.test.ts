@@ -129,8 +129,8 @@ test("remote tools minimize SSH round-trips, handle symlinks/images/@~ paths, an
   }
 
   await assert.rejects(
-    tools.bash!.execute("b-timeout", { command: "printf 'streamed-before-timeout\\n'; sleep 3", timeout: 0.1 }, undefined, undefined, ctx),
-    /streamed-before-timeout[\s\S]*Command timed out after 0\.1 seconds/,
+    tools.bash!.execute("b-timeout", { command: "printf 'streamed-before-timeout\\n'; sleep 5", timeout: 0.4 }, undefined, undefined, ctx),
+    /streamed-before-timeout[\s\S]*Command timed out after 0\.4 seconds/,
   );
 
   // Verify sentinel framing tolerates noisy SSH login banners on stdout.

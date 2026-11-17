@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0 - 2026-11-18
+
+- Add session-scoped keep-alive SSH Python RPC worker pooling with automatic SSH config change rotation and idle cleanup.
+- Reduce remote tool round-trips (`ls` from `3 + N` to 1 RPC, `read`, `write`, and `find` to 1 RPC, `edit` to 2 RPCs) and sniff image MIME types (including BMP) from fetched bytes.
+- Inject remote `AGENTS.md` / `CLAUDE.md` project context and structured `<ssh_workspace>` prompt sections while isolating unrelated local context and strictly enforcing `blocked` mode across user input and tool calls.
+- Stream remote `ripgrep --json` matches with early stop, relative paths, long-line truncation, and native `GrepToolDetails` metadata; preserve partial streamed `bash` output on timeout or cancellation.
+- Harden remote RPC framing with sentinel markers, login-shell-independent `PATH` discovery, NFS directory lock fallback, and `umask`-aware file creation; skip non-discovery directives during SSH config scanning.
+- Add `/remote` argument completions, `/remote remove` and `pi-remote remove`, readable workspace slug IDs, Dashboard new-file creation, keyboard shortcuts, case-insensitive search toggle, and live SSH host resolution preview.
+
 ## 0.1.1 - 2026-11-16
 
 - Wait for asynchronous npm publication to become public before completing a release.
