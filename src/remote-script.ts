@@ -360,8 +360,9 @@ def main(p):
         if not shutil.which("git"): raise RuntimeError("git is not installed on this host")
         args = ["git", "--no-pager", "-c", "core.quotePath=false", "-c", "color.ui=false"]
         action = p.get("action", "status")
-        if action == "status": args += ["status", "--short", "--branch", "--", root]
-        elif action in ["diff", "staged"]: args += ["diff", "--no-ext-diff", "--no-textconv"] + (["--cached"] if action == "staged" else []) + ["--", root]
+        target = safe(os.path.join(root, p["path"])) if p.get("path") else root
+        if action == "status": args += ["status", "--short", "--branch", "--", target]
+        elif action in ["diff", "staged"]: args += ["diff", "--no-ext-diff", "--no-textconv"] + (["--cached"] if action == "staged" else []) + ["--", target]
         else: raise RuntimeError("Unknown Git action")
         return bounded(args, root, timeout=cmd_timeout)
     if op in ["grep", "find"]:

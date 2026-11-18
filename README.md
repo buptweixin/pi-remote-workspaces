@@ -85,13 +85,16 @@ The extension menus and dashboard currently use Simplified Chinese. Command name
 ```text
 /remote                  Open the configuration and workspace menu
 /remote add              Select an SSH host and add a workspace
+/remote edit [id]        Edit a saved workspace configuration
 /remote remove my-app    Remove a saved workspace configuration
-/remote hosts            Reload SSH config and show aliases with their sources
+/remote hosts            Reload SSH config and show or import host aliases
 /remote use my-app-dev   Bind this session to a saved workspace
+/remote files [path]     Browse, search, create, and edit remote files in native modals
+/remote git              Inspect remote Git status and diffs in native modals
 /remote test             Check connectivity and Python/Git/ripgrep availability
 /remote status           Show the current workspace and check connectivity
-/remote web              Start this session's browser configuration dashboard
-/remote local            Unbind the remote workspace and restore local tools
+/remote web              Start this session's standalone browser dashboard
+/remote local            Unbind the remote workspace and restore local tools (alias: unbind)
 ```
 
 To disconnect a session, send `/remote local`, or choose **Switch to local** (`切换到本地`) from `/remote`. Saved workspace configurations remain available.
@@ -104,11 +107,15 @@ The CLI also accepts a workspace at startup: `pi --remote my-app-dev`. If the re
 npx @agegr/pi-web@latest
 ```
 
-Send `/remote` to use native browser selection and input dialogs. `/remote web` provides a link to the separate dashboard.
+Native `pi-web` UI integration works out of the box without patching `pi-web`:
 
-Integration has been tested with **pi-web 0.17.0 and `@earendil-works/pi-coding-agent` 1.5.2**, covering package loading, real SSH binding, notifications, configuration dialogs, and cancellation through Stop. These tests require no model credentials or LLM calls.
+- **Clickable status-shelf toolbar buttons (`ExtensionStatusBar` `command:` protocol)**: Shows a clickable **`SSH: 本地`** button right below the chat input when unbound (opening the native workspace switcher/creator modal with one click, no typing `/remote` needed), and **`● SSH <host> · <path>`**, **`远程文件`**, **`Git 状态`**, **`探测连接`**, and **`切回本地`** buttons plus a collapsible ANSI details drawer (`▲ pi-remote`) when bound.
+- **In-page native modal file browser/editor & Git inspector**: Click **`远程文件`** (`/remote files`) to navigate remote directories, run `find`/`grep` searches, create files, or edit and atomically save remote UTF-8 files (with optimistic `etag` conflict checks) inside `pi-web`'s built-in monospace editor modal; click **`Git 状态`** (`/remote git`) to inspect dirty files and per-file or full diffs.
+- **Official session-liveness integration (`@agegr/pi-web/session-liveness/v1`)**: Registers a session-scoped liveness lease so active interactive flows or an open `/remote web` standalone dashboard are not evicted by `pi-web`'s 10-minute idle timer.
 
-Pi-web's own file browser and terminal still use its local session directory. Use the Pi Remote dashboard or the bound agent tools for remote files and commands. This extension does not inject a sidebar or patch pi-web.
+Integration has been tested with **pi-web 0.17.0 and `@earendil-works/pi-coding-agent` 1.5.2**, covering package loading, clickable `command:` status-shelf buttons, real SSH binding, native modals, and cancellation through Stop. These tests require no model credentials or LLM calls.
+
+Pi-web's built-in right sidebar file explorer and terminal still point to its local server directory; use the **`远程文件` / `Git 状态`** toolbar modals, bound agent tools, or `/remote web` dashboard for remote files and commands.
 
 ### PI-Desktop
 

@@ -85,13 +85,16 @@ pi 的包清单在 `package.json` 的 `pi.extensions` 字段中，入口为 `src
 ```text
 /remote                  配置与工作区选择菜单
 /remote add              从 SSH config 选择主机并添加工作区
+/remote edit [id]        编辑已保存的工作区配置
 /remote remove my-app    删除已保存的工作区配置
-/remote hosts            重新读取 SSH config，显示主机及来源
+/remote hosts            重新读取 SSH config，显示或导入主机
 /remote use my-app-dev   绑定已保存的工作区
+/remote files [path]     在原生弹窗中浏览、搜索、新建与编辑远程文件
+/remote git              在原生弹窗中查看远程 Git 状态与文件 Diff
 /remote test             检查连接及 Python/Git/ripgrep 可用性
 /remote status           查看当前工作区并检查连接
-/remote web              启动本会话的浏览器配置与文件管理界面
-/remote local            恢复本地工具
+/remote web              启动本会话的独立浏览器配置与文件管理界面
+/remote local            恢复本地工具（同 /remote unbind）
 ```
 
 CLI 也支持启动时指定工作区：`pi --remote my-app-dev`。若指定的工作区无法连接，会话进入阻止执行状态；用 `/remote use <id>` 重新绑定，或显式 `/remote local`。
@@ -102,11 +105,15 @@ CLI 也支持启动时指定工作区：`pi --remote my-app-dev`。若指定的�
 npx @agegr/pi-web@latest
 ```
 
-在对话中发送 `/remote` 即可使用原生浏览器选择框与输入框；`/remote web` 会提供独立管理界面的链接。
+无需修改 `pi-web` 源码即可获得原生嵌入交互体验：
 
-已实际验证 **pi-web 0.17.0 + `@earendil-works/pi-coding-agent` 1.5.2** 的包加载、SSH 绑定、状态通知、配置选择框和 Stop 关闭流程，无需模型凭据或 LLM 调用。
+- **输入框下方原生可点击状态栏按钮（`ExtensionStatusBar` `command:` 协议）**：未绑定时常驻 **`SSH: 本地`** 按钮，点击直接呼出工作区选择/新建弹窗（无需手动输入 `/remote`）；绑定后并排显示 **`● SSH <host> · <path>`**、**`远程文件`**、**`Git 状态`**、**`探测连接`**、**`切回本地`** 原生按钮，以及可按需展开的 ANSI 详情抽屉（`▲ pi-remote`）。
+- **页内原生弹窗文件浏览/编辑与 Git Diff**：点击 **`远程文件`**（或 `/remote files`）即可在 `pi-web` 原生模态框中逐级浏览远端目录、执行 `find`/`grep` 搜索、新建文件，或用内置等宽代码编辑器弹窗直接修改并原子保存远端文本文件（带并发 `etag` 冲突保护）；点击 **`Git 状态`**（或 `/remote git`）可查看远端分支变更列表与单文件/全量 Diff。
+- **官方会话防休眠接入（`@agegr/pi-web/session-liveness/v1`）**：在交互操作或开启 `/remote web` 独立工作台期间自动续租会话活跃状态，避免被 10 分钟空闲回收中断。
 
-pi-web 自带的文件栏和终端仍属于它的本地会话目录。查看远程文件和执行远程命令，请使用 Pi Remote 管理界面或已绑定会话的 agent 工具。当前没有向 pi-web 注入侧栏或修改宿主源码。
+已实际验证 **pi-web 0.17.0 + `@earendil-works/pi-coding-agent` 1.5.2** 的包加载、原生可点击状态栏命令按钮、SSH 绑定、配置弹窗和 Stop 关闭流程，无需模型凭据或 LLM 调用。
+
+`pi-web` 右侧自带的文件栏和终端仍属于它的服务端本地会话目录；查看与编辑远程文件可直接使用输入框下方的 **`远程文件` / `Git 状态`** 原生弹窗、已绑定会话的 agent 工具或 `/remote web` 独立工作台。
 
 ### PI-Desktop
 

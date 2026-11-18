@@ -50,6 +50,7 @@ const RUNTIME_FILES = [
   "dashboard-api.js",
   "server.js",
   "tools.js",
+  "pi-web.js",
   "extension.js",
 ];
 const PUBLIC_VIEW_FILES = ["index.html", "app.js", "style.css", "favicon.svg"];

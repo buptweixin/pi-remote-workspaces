@@ -56,6 +56,12 @@ test("npx pi-web loads the package, serves /remote dialogs and binds real SSH wo
   // Extension commands use no model credentials and make no LLM calls.
   await post(`/api/agent/${id}`, { type: "prompt", message: "/remote use test" });
   await post(`/api/agent/${id}`, { type: "prompt", message: "/remote test" });
+  for (let attempt = 0; attempt < 40 && !captured.includes('"statusKey":"command:/remote files"'); attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  assert.match(captured, /"statusKey":"command:\/remote"/);
+  assert.match(captured, /"statusKey":"command:\/remote files"/);
+  assert.match(captured, /"statusKey":"command:\/remote unbind"/);
   // Opening /remote emits a browser-compatible select dialog. Stop closes it.
   // This HTTP call stays pending until the select is answered or aborted.
   const selecting = post(`/api/agent/${id}`, { type: "prompt", message: "/remote" }).catch(() => undefined);
@@ -65,5 +71,10 @@ test("npx pi-web loads the package, serves /remote dialogs and binds real SSH wo
   assert.match(captured, /"method":"select"/);
   await post(`/api/agent/${id}`, { type: "abort" });
   await selecting;
+  await post(`/api/agent/${id}`, { type: "prompt", message: "/remote unbind" });
+  for (let attempt = 0; attempt < 40 && !captured.includes("SSH: 本地"); attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  assert.match(captured, /SSH: 本地/);
   assert.doesNotMatch(logs, /Failed to load extension|Cannot find module|Extension load error/);
 });

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0 - 2026-11-18
+
+- Add native [pi-web](https://github.com/agegr/pi-web) status-shelf toolbar buttons (`ExtensionStatusBar` `command:` protocol) without patching `pi-web`: unbound sessions show a clickable `SSH: 本地` pill right below the chat composer, and bound sessions show `● SSH <host> · <path>`, `远程文件`, `Git 状态`, `探测连接`, and `切回本地` buttons alongside a collapsible ANSI details drawer (`▲ pi-remote`) while keeping `pi` CLI TUI unbound footers silent.
+- Add in-modal remote file browser, `find`/`grep` search, file creation, and inline UTF-8 editor (`/remote files [path]`) powered by `ctx.ui.editor` with binary/size guards and optimistic `etag` conflict confirmation.
+- Add in-modal remote Git status and per-file/full diff inspector (`/remote git`) plus interactive workspace editing (`/remote edit [id]`) and `/remote unbind` alias.
+- Integrate with `pi-web`'s official `@agegr/pi-web/session-liveness/v1` registry to prevent automatic 10-minute idle session eviction during active interactive flows or while a `/remote web` standalone dashboard is running.
+
 ## 0.3.0 - 2026-11-18
 
 - Add native [PI-Desktop](https://github.com/vastsa/PI-Desktop) plugin (`io.github.buptweixin.pi-remote`) with store-only `.piplug` packaging, development hot-reload support, and offline `Import pi extension` compatibility.
