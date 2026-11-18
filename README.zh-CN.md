@@ -2,13 +2,13 @@
 
 [English](README.md) | 简体中文
 
-让 **pi coding agent** 和 **pi-web** 在 SSH 远程项目中读写文件、执行命令。参考 [dsh-remote](https://github.com/flymysql/dsh-remote) 的远程工作区体验，使用 pi 的原生扩展接口实现。
+让 **pi coding agent**、**pi-web** 和 **[PI-Desktop](https://github.com/vastsa/PI-Desktop)** 在 SSH 远程项目中读写文件、执行命令。参考 [dsh-remote](https://github.com/flymysql/dsh-remote) 的远程工作区体验，同时提供原生 pi 扩展与 PI-Desktop 原生插件。
 
 - 动态发现 `~/.ssh/config`、系统配置和递归 `Include` 中的明确主机别名；支持通配 Include、双引号路径和多个 Host 别名。
 - 真正的连接由系统 **OpenSSH** 完成，沿用 `ProxyJump`、`ProxyCommand`、IdentityFile、ssh-agent 和 Host/Match 规则；不复制或保存私钥、密码。
-- 多个保存的工作区，每个 pi 会话独立绑定主机和目录；绑定记录保存在会话分支里，支持恢复。
-- 将 pi 的 `read`、`write`、`edit`、`bash`、`grep`、`find`、`ls` 以及用户 `!` 命令路由到远程；复用原生读写工具、图片结果和编辑 diff。
-- `/remote` 配置菜单同时兼容 TUI 和 pi-web。独立浏览器界面提供工作区配置、连接测试、目录浏览、文本编辑、内容/文件名搜索、Git 状态及差异、一次性 bash 命令。
+- 多个保存的工作区，每个会话独立绑定主机和目录；绑定记录持久化并在恢复或切换模型时保留。
+- 在 **pi / pi-web** 中将 `read`、`write`、`edit`、`bash`、`grep`、`find`、`ls` 以及用户 `!` 命令路由到远程；在 **PI-Desktop** 中自动激活 `remote_read`、`remote_write`、`remote_edit`、`remote_bash`、`remote_ls`、`remote_find`、`remote_grep` 并与本地内置工具共存。
+- `/remote` 配置菜单同时兼容 TUI、pi-web 和 PI-Desktop。管理工作台既可作为独立浏览器界面启动，也可在 PI-Desktop 右侧工作面板（`SSH 远程工作区`）或独立窗口内嵌运行，支持一键绑定/解绑当前聊天会话。
 - 文件写入使用临时文件和原子替换；编辑与浏览器保存检测版本冲突，保留已有文件权限。远程连接错误不会回退到本地执行。
 
 ## 环境
@@ -108,6 +108,23 @@ npx @agegr/pi-web@latest
 
 pi-web 自带的文件栏和终端仍属于它的本地会话目录。查看远程文件和执行远程命令，请使用 Pi Remote 管理界面或已绑定会话的 agent 工具。当前没有向 pi-web 注入侧栏或修改宿主源码。
 
+### PI-Desktop
+
+适配 [vastsa/PI-Desktop](https://github.com/vastsa/PI-Desktop)（已验证 **PI-Desktop 0.22.0+**），无第三方运行依赖，提供三种接入方式：
+
+1. **安装 `.piplug` 原生插件包（推荐）**：
+   先在本地执行 `npm run build`（或从 GitHub Release 下载 `.piplug`），打开 PI-Desktop → **Plugins** → 右上角菜单 **Install plugin package** → 选择 `release-artifacts/io.github.buptweixin.pi-remote-<version>.piplug`。
+2. **加载开发插件目录（支持热重载）**：
+   执行 `npm run build` 后，打开 PI-Desktop → **Plugins** → **Load development plugin** → 选择仓库下的 `pi-desktop` 目录。
+3. **导入 pi 扩展（仅 Agent 扩展）**：
+   打开 PI-Desktop → **Plugins** → 右上角菜单 **Import pi extension** → 选择本仓库根目录（零外部 npm 依赖，离线直接导入）。
+
+在 PI-Desktop 中的体验：
+
+- **聊天输入框内嵌胶囊与原生右侧面板**：在 PI-Desktop 聊天输入框左下角工具栏直接挂载 `SSH` 胶囊按钮（沿用宿主 `--ds-*` 主题变量），点击即可在主窗口内弹出原生浮层完成 SSH 主机选择、新建、连接测试与解绑；右侧工作面板中的「**SSH 远程**」视图采用与内置「文件管理器」一致的深浅色自适应紧凑布局，自动跟随当前会话，并支持目录树折叠、彩色 Git Diff、点击搜索结果跳转文件对应行以及远程命令执行。
+- **双端工具共存**：由于 PI-Desktop 保留内置核心工具名（`Read`/`Write`/`Edit`/`Bash`/`Glob`/`Grep`），绑定远程工作区后会自动激活 `remote_read`、`remote_write`、`remote_edit`、`remote_bash`、`remote_ls`、`remote_find`、`remote_grep` 并注入远端 `AGENTS.md` / `CLAUDE.md` 上下文，同时保留本地内置工具可用，方便跨本机与远端协同操作。
+- **斜杠命令**：在输入框输入 `/remote` 即可调用原生弹窗完成绑定、添加、删除、状态检查等全部子命令。
+
 ### 独立浏览器配置界面
 
 不启动 agent 也能配置：
@@ -137,8 +154,9 @@ node dist/cli.js serve --port 30142
 
 默认写入 `~/.pi/agent/remote.json`，文件权限 `0600`。配置更新带跨进程锁，并通过原子替换保存。
 
-- `PI_CODING_AGENT_DIR`：更改 pi 配置目录，与 pi-web 保持一致。
+- `PI_CODING_AGENT_DIR`：更改 pi 配置目录，与 pi-web / PI-Desktop 保持一致。
 - `PI_REMOTE_CONFIG`：覆盖远程工作区配置文件路径。
+- `PI_REMOTE_SESSIONS`：覆盖 PI-Desktop 会话绑定状态文件路径（默认与 `remote.json` 同目录下的 `remote-sessions.json`）。
 
 ```json
 {
@@ -202,6 +220,7 @@ npm pack --dry-run
 - [dsh-remote](https://github.com/flymysql/dsh-remote)：远程工作区交互参考。
 - [pi 扩展文档](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md) 与 [SSH 示例](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/examples/extensions/ssh.ts)：工具操作接口。
 - [pi-web](https://github.com/agegr/pi-web)：浏览器宿主。
+- [PI-Desktop](https://github.com/vastsa/PI-Desktop)：桌面工作区宿主。
 
 ## 许可证
 

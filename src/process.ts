@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 export interface RunOptions {
   input?: string | Buffer;
@@ -7,6 +7,7 @@ export interface RunOptions {
   maxBytes?: number;
   onData?: (data: Buffer) => void;
   collect?: boolean;
+  env?: NodeJS.ProcessEnv;
 }
 
 export interface RunResult { stdout: Buffer; stderr: Buffer; exitCode: number }
@@ -19,6 +20,25 @@ export class ProcessTimeoutError extends Error {
 }
 
 const MAX_STDERR_BYTES = 65_536;
+let cachedLaunchdAuthSock: string | null | undefined;
+
+/**
+ * Resolve child environment for OpenSSH. PI-Desktop's plugin utility process omits
+ * SSH_AUTH_SOCK from its minimal environment; on macOS, recover launchd's agent socket.
+ */
+export function sshChildEnv(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  if (baseEnv.SSH_AUTH_SOCK || process.platform !== "darwin") return baseEnv;
+  if (cachedLaunchdAuthSock === undefined) {
+    try {
+      const probe = spawnSync("/bin/launchctl", ["getenv", "SSH_AUTH_SOCK"], { encoding: "utf8", timeout: 1000 });
+      const sock = probe.status === 0 ? probe.stdout.trim() : "";
+      cachedLaunchdAuthSock = sock || null;
+    } catch {
+      cachedLaunchdAuthSock = null;
+    }
+  }
+  return cachedLaunchdAuthSock ? { ...baseEnv, SSH_AUTH_SOCK: cachedLaunchdAuthSock } : baseEnv;
+}
 
 export function killProcessGroup(pid: number | undefined, killChild: (signal: NodeJS.Signals) => void): NodeJS.Timeout {
   const send = (signal: NodeJS.Signals) => {
@@ -37,7 +57,8 @@ export function killProcessGroup(pid: number | undefined, killChild: (signal: No
 export function runProcess(program: string, args: string[], options: RunOptions = {}): Promise<RunResult> {
   if (options.signal?.aborted) return Promise.reject(new ProcessAbortError(options.signal.reason));
   return new Promise((resolve, reject) => {
-    const child = spawn(program, args, { stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
+    const env = options.env ?? (program === "ssh" ? sshChildEnv() : process.env);
+    const child = spawn(program, args, { stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env });
     const stdout: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let stderrBytes = 0;

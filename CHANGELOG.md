@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0 - 2026-11-18
+
+- Add native [PI-Desktop](https://github.com/vastsa/PI-Desktop) plugin (`io.github.buptweixin.pi-remote`) with store-only `.piplug` packaging, development hot-reload support, and offline `Import pi extension` compatibility.
+- Embed an in-composer SSH workspace selector pill (`composerControl` slot) and in-window management modal directly inside PI-Desktop's chat toolbar, alongside a Light/Dark-synced docked right Work Panel view (`SSH 远程`) with collapsible file tree, colored Git diffs, click-to-open search hits, and remote command execution.
+- Add standalone `remote_read`, `remote_write`, `remote_edit`, `remote_bash`, `remote_ls`, `remote_find`, and `remote_grep` tools for PI-Desktop with automatic `setActiveTools` activation, remote `AGENTS.md` / `CLAUDE.md` prompt injection, live session binding synchronization (`remote-sessions.json`), and dual-end coexistence with local built-in tools.
+- Replace `proper-lockfile` with a zero-dependency cross-process atomic directory lock and recover macOS `launchd` `SSH_AUTH_SOCK` inside minimal plugin utility processes.
+
 ## 0.2.0 - 2026-11-18
 
 - Add session-scoped keep-alive SSH Python RPC worker pooling with automatic SSH config change rotation and idle cleanup.

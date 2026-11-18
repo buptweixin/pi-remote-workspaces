@@ -7,3 +7,9 @@ coverage/
 .env
 .npmrc
 release-artifacts/
+pi-desktop/main.js
+pi-desktop/package.json
+pi-desktop/LICENSE
+pi-desktop/renderer/
+pi-desktop/runtime/
+pi-desktop/views/

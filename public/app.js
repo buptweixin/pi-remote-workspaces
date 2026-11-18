@@ -1,18 +1,42 @@
 "use strict";
 const $ = id => document.getElementById(id);
+const desktopBridge = typeof window.pluginBridge?.invoke === "function" ? window.pluginBridge : null;
 const fragment = new URLSearchParams(location.hash.slice(1));
 const initialWorkspaceId = fragment.get("workspace") || "";
-if (fragment.has("token")) sessionStorage.setItem("pi-remote-token", fragment.get("token"));
-if (location.hash) history.replaceState(null, "", location.pathname + location.search);
-const token = sessionStorage.getItem("pi-remote-token") || "";
+if (!desktopBridge) {
+  if (fragment.has("token")) sessionStorage.setItem("pi-remote-token", fragment.get("token"));
+  if (location.hash) history.replaceState(null, "", location.pathname + location.search);
+}
+const token = desktopBridge ? "" : (sessionStorage.getItem("pi-remote-token") || "");
+
 let state, selected, directory = ".", file, editingId, commandController, resolveController, resolveTimer, toastTimer, fileReadSequence = 0;
+let desktopSession = { active: null, sessionId: "", state: { mode: "local" } };
+
 const dirty = () => file && $("file-content").value !== file.saved;
 function canLeave() { return !dirty() || confirm("文件有未保存的修改，确定放弃这些修改吗？"); }
 function toast(message, error = false) {
   $("toast").textContent = message; $("toast").className = error ? "error" : ""; $("toast").hidden = false;
   clearTimeout(toastTimer); toastTimer = setTimeout(() => { $("toast").hidden = true; }, error ? 9000 : 4000);
 }
+async function copyText(text) {
+  if (desktopBridge) {
+    await desktopBridge.invoke("pi-remote.copyText", { text });
+    return;
+  }
+  await navigator.clipboard.writeText(text);
+}
 async function api(path, method = "GET", data, signal) {
+  if (desktopBridge) {
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    return new Promise((resolve, reject) => {
+      const onAbort = () => reject(new DOMException("Aborted", "AbortError"));
+      signal?.addEventListener("abort", onAbort, { once: true });
+      desktopBridge.invoke("pi-remote.api", { path, method, data }).then(
+        result => { signal?.removeEventListener("abort", onAbort); resolve(result); },
+        error => { signal?.removeEventListener("abort", onAbort); reject(error); },
+      );
+    });
+  }
   const response = await fetch(path, { method, signal, headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" }, ...(data === undefined ? {} : { body: JSON.stringify(data) }) });
   const raw = await response.text();
   let result = {};
@@ -37,6 +61,53 @@ function clearFile() {
   $("save-file").disabled = true; $("reload-file").disabled = true; $("file-dirty").textContent = "";
   syncActiveFileRow();
 }
+function renderSessionBar() {
+  if (!selected) return;
+  $("copy-command").textContent = `/remote use ${selected.id}  ⧉`;
+  if (!desktopBridge) {
+    $("agent-bar-label").textContent = "在 pi / pi-web / PI-Desktop 中绑定此工作区";
+    $("bind-session").hidden = true;
+    $("unbind-session").hidden = true;
+    $("session-dot").classList.remove("inactive");
+    return;
+  }
+  const activeId = desktopSession.sessionId;
+  const bound = desktopSession.state?.mode === "remote" ? desktopSession.state.binding?.workspace : null;
+  if (!activeId) {
+    $("agent-bar-label").textContent = "请先在左侧选择或新建聊天会话，或在对话中输入命令";
+    $("bind-session").hidden = true;
+    $("unbind-session").hidden = true;
+    $("session-dot").classList.add("inactive");
+    return;
+  }
+  if (bound?.id === selected.id) {
+    $("agent-bar-label").textContent = `当前聊天会话已绑定此远程工作区（remote_* 与本地工具双端共存）`;
+    $("bind-session").hidden = true;
+    $("unbind-session").hidden = false;
+    $("session-dot").classList.remove("inactive");
+  } else if (bound) {
+    $("agent-bar-label").textContent = `当前会话已绑定「${bound.name}」(${bound.host}:${bound.path})`;
+    $("bind-session").textContent = "切换绑定到此工作区";
+    $("bind-session").hidden = false;
+    $("unbind-session").hidden = false;
+    $("session-dot").classList.remove("inactive");
+  } else {
+    $("agent-bar-label").textContent = "一键将此 SSH 工作区绑定到当前聊天会话";
+    $("bind-session").textContent = "绑定到当前会话";
+    $("bind-session").hidden = false;
+    $("unbind-session").hidden = true;
+    $("session-dot").classList.add("inactive");
+  }
+}
+async function refreshDesktopSession() {
+  if (!desktopBridge) return;
+  try {
+    desktopSession = await desktopBridge.invoke("pi-remote.sessionStatus");
+  } catch {
+    desktopSession = { active: null, sessionId: "", state: { mode: "local" } };
+  }
+  renderSessionBar();
+}
 async function refresh() {
   state = await api("/api/state");
   $("app-version").textContent = `/ v${state.version}`;
@@ -47,6 +118,7 @@ async function refresh() {
   $("hosts").replaceChildren(...state.inventory.hosts.map(host => { const row = node("div", undefined, "host-row"); const button = node("button", host.alias); button.title = `${host.source}:${host.line}`; button.onclick = () => openWorkspace(undefined, host.alias); row.append(button); return row; }));
   if (!state.inventory.hosts.length) $("hosts").append(node("p", "尚未发现主机，可手动添加。", "hint"));
   if (selected) selected = state.config.workspaces.find(w => w.id === selected.id);
+  await refreshDesktopSession();
   renderWorkspaces();
 }
 function renderWorkspaces() {
@@ -61,7 +133,7 @@ function renderWorkspaces() {
   $("test-connection").disabled = !active; $("edit-workspace").disabled = !active;
   $("workspace-title").textContent = selected?.name || "远程工作区";
   $("workspace-subtitle").textContent = selected ? `${selected.host} / ${selected.path}` : "从 SSH 配置开始，让 pi 在远程项目中工作。";
-  if (selected) $("copy-command").textContent = `/remote use ${selected.id}  ⧉`;
+  renderSessionBar();
 }
 async function selectWorkspace(workspace) {
   if (selected?.id === workspace.id) return;
@@ -98,7 +170,7 @@ async function openFile(path, force = false) {
   if (file === previousFile && $("file-content").value !== previousContent && !canLeave()) return;
   const bytes = Uint8Array.from(atob(result.data), c => c.charCodeAt(0));
   const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
-  if (text.includes("\0")) throw new Error("此文件是二进制文件，请通过 pi 的 read 工具查看。");
+  if (text.includes("\0")) throw new Error("此文件是二进制文件，请通过 Agent 的远程读取工具查看。");
   // Preserve CRLF only when all line endings in the original file consistently use CRLF.
   const crlf = text.includes("\r\n") && !text.replaceAll("\r\n", "").includes("\n");
   $("file-content").value = text;
@@ -151,7 +223,7 @@ $("workspace-form").onsubmit = async event => {
     const updated = await api(editingId ? `/api/workspaces/${editingId}` : "/api/workspaces", editingId ? "PUT" : "POST", data);
     $("workspace-dialog").close();
     if (wasSelected) { selected = undefined; clearFile(); }
-    await refresh(); await selectWorkspace(updated); toast("工作区已保存，可在 pi 中运行对应 /remote use 命令。");
+    await refresh(); await selectWorkspace(updated); toast("工作区已保存。");
   } catch (error) { $("workspace-error").textContent = error.message; }
 };
 $("delete-workspace").onclick = perform(async () => {
@@ -180,23 +252,58 @@ $("test-connection").onclick = perform(async () => {
     toast(`Python ${result.python} · Git ${result.git ? "可用" : "未安装"} · ripgrep ${result.ripgrep ? "可用" : "未安装"}`);
   } catch (error) { if (selected?.id === id) { $("connection-state").textContent = "连接失败"; $("connection-state").className = "badge"; } throw error; }
 });
-$("copy-command").onclick = perform(async () => { await navigator.clipboard.writeText(`/remote use ${selected.id}`); toast("绑定命令已复制"); });
+$("copy-command").onclick = perform(async () => { await copyText(`/remote use ${selected.id}`); toast("绑定命令已复制"); });
+$("bind-session").onclick = perform(async () => {
+  if (!desktopBridge || !selected) return;
+  $("bind-session").disabled = true;
+  try {
+    const result = await desktopBridge.invoke("pi-remote.bindSession", { workspaceId: selected.id });
+    await refreshDesktopSession();
+    $("connection-state").textContent = `已连接 · ${result.probe.hostname}`;
+    $("connection-state").className = "badge connected";
+    toast(`已绑定到当前聊天会话：${selected.host}:${result.probe.root}`);
+  } finally {
+    $("bind-session").disabled = false;
+  }
+});
+$("unbind-session").onclick = perform(async () => {
+  if (!desktopBridge) return;
+  await desktopBridge.invoke("pi-remote.unbindSession", {});
+  await refreshDesktopSession();
+  toast("已取消当前聊天会话的远程绑定");
+});
+$("popout-window").onclick = perform(async () => {
+  if (desktopBridge) await desktopBridge.invoke("pi-remote.openWindow", {});
+});
 for (const button of document.querySelectorAll("[data-tab]")) button.onclick = () => {
   for (const other of document.querySelectorAll("[data-tab]")) { other.classList.toggle("active", other === button); $(`panel-${other.dataset.tab}`).hidden = other !== button; }
 };
 $("parent-directory").onclick = perform(async () => { directory = directory.includes("/") ? directory.slice(0, directory.lastIndexOf("/")) : "."; await listFiles(); });
-$("new-file").onclick = perform(async () => {
+$("new-file").onclick = () => {
   if (!canLeave()) return;
-  const input = prompt(`在 ${directory === "." ? "工作区根目录" : directory} 下新建文件路径：`);
-  const rel = (input || "").trim().replace(/^\/+/, "");
+  $("new-file-form").reset();
+  $("new-file-error").textContent = "";
+  $("new-file-directory").textContent = `目标目录：${directory === "." ? "工作区根目录 (/)" : directory}`;
+  $("new-file-dialog").showModal();
+  $("new-file-form").elements.namedItem("relativePath").focus();
+};
+$("new-file-form").onsubmit = async event => {
+  event.preventDefault();
+  $("new-file-error").textContent = "";
+  const rel = String(new FormData(event.currentTarget).get("relativePath") || "").trim().replace(/^\/+/, "");
   if (!rel) return;
   const target = directory === "." ? rel : `${directory}/${rel}`;
-  await api(endpoint("write"), "POST", { path: target, etag: null, content: "" });
-  await listFiles();
-  await openFile(target, true);
-  $("file-content").focus();
-  toast(`已创建 ${target}`);
-});
+  try {
+    await api(endpoint("write"), "POST", { path: target, etag: null, content: "" });
+    $("new-file-dialog").close();
+    await listFiles();
+    await openFile(target, true);
+    $("file-content").focus();
+    toast(`已创建 ${target}`);
+  } catch (error) {
+    $("new-file-error").textContent = error.message;
+  }
+};
 $("refresh-files").onclick = perform(listFiles);
 $("file-content").oninput = updateDirty;
 $("file-content").addEventListener("keydown", event => {
@@ -257,8 +364,18 @@ $("command-form").onsubmit = perform(async () => {
 });
 $("cancel-command").onclick = () => commandController?.abort();
 window.addEventListener("beforeunload", event => { if (dirty()) { event.preventDefault(); event.returnValue = ""; } });
+
+if (desktopBridge) {
+  if (document.documentElement.dataset.piPluginPanelShape === "view") {
+    $("popout-window").hidden = false;
+  }
+  desktopBridge.on?.("session:activated", () => { void refreshDesktopSession(); });
+  window.addEventListener("focus", () => { void refreshDesktopSession(); });
+}
+
 perform(async () => {
   await refresh();
-  const initial = (initialWorkspaceId && state.config.workspaces.find(w => w.id === initialWorkspaceId)) || state.config.workspaces[0];
+  const preferredId = initialWorkspaceId || (desktopSession.state?.mode === "remote" ? desktopSession.state.binding?.workspace?.id : "");
+  const initial = (preferredId && state.config.workspaces.find(w => w.id === preferredId)) || state.config.workspaces[0];
   if (initial) await selectWorkspace(initial);
 })();

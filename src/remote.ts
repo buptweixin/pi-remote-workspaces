@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { validateHost, type RemoteConfig, type Workspace } from "./config.js";
-import { killProcessGroup, ProcessAbortError, ProcessTimeoutError, runProcess, shellQuote, type RunOptions, type RunResult } from "./process.js";
+import { killProcessGroup, ProcessAbortError, ProcessTimeoutError, runProcess, shellQuote, sshChildEnv, type RunOptions, type RunResult } from "./process.js";
 import { sshArgs, sshConfigSignature } from "./ssh-config.js";
 import { REMOTE_JSON_SENTINEL, remoteScript } from "./remote-script.js";
 
@@ -41,7 +41,7 @@ class PooledWorker {
   private waiter: { resolve: (line: string) => void; reject: (error: Error) => void } | undefined;
 
   constructor(readonly host: string, readonly key: string, args: string[]) {
-    this.child = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
+    this.child = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env: sshChildEnv() });
     this.child.stdout.setEncoding("utf8");
     this.child.stdout.on("data", (chunk: string) => {
       this.stdoutBuf += chunk;

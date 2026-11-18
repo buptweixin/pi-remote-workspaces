@@ -2,13 +2,13 @@
 
 English | [简体中文](README.zh-CN.md)
 
-SSH workspaces for **pi coding agent** and **pi-web**. Let your agent read and edit files, search projects, and run commands on a remote host. Inspired by the workspace experience in [dsh-remote](https://github.com/flymysql/dsh-remote), implemented through pi's extension API.
+SSH workspaces for **pi coding agent**, **pi-web**, and **[PI-Desktop](https://github.com/vastsa/PI-Desktop)**. Let your agent read and edit files, search projects, and run commands on a remote host. Inspired by the workspace experience in [dsh-remote](https://github.com/flymysql/dsh-remote), implemented as both a native pi extension and a native PI-Desktop plugin.
 
 - Discover concrete host aliases dynamically from `~/.ssh/config`, system configuration, and recursive `Include` directives. Supports glob includes, double-quoted paths, and multiple aliases per `Host` line.
 - Use your system **OpenSSH** client, including `ProxyJump`, `ProxyCommand`, `IdentityFile`, ssh-agent, and Host/Match rules. No private keys or passwords are copied or stored by this extension.
-- Save multiple workspaces and bind each pi session to its own host and directory. Bindings are stored in the session branch and restored when you resume it.
-- Route pi's `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls` tools, plus user `!` commands, to the remote workspace. Retain native file tools, image results, and edit diffs.
-- Configure workspaces through `/remote` in either TUI or pi-web. A separate browser dashboard provides connection settings, file browsing and editing, content and filename search, Git status and diffs, and one-shot bash commands.
+- Save multiple workspaces and bind each session to its own host and directory. Bindings persist across session resume, model switches, and restarts.
+- Route pi's `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls` tools (plus user `!` commands) to the remote workspace in **pi / pi-web**; in **PI-Desktop**, automatically activate `remote_read`, `remote_write`, `remote_edit`, `remote_bash`, `remote_ls`, `remote_find`, and `remote_grep` alongside local built-in tools.
+- Configure workspaces through `/remote` across TUI, pi-web, and PI-Desktop. The workbench runs both as a standalone browser dashboard and docked inside PI-Desktop's right Work Panel (`SSH Remote` / `SSH 远程工作区`) or standalone panel window with one-click session binding.
 - Write files through temporary files and atomic replacement. Editing and dashboard saves check for version conflicts and preserve existing file permissions. SSH failures never fall back to local execution.
 
 ## Requirements
@@ -110,6 +110,23 @@ Integration has been tested with **pi-web 0.17.0 and `@earendil-works/pi-coding-
 
 Pi-web's own file browser and terminal still use its local session directory. Use the Pi Remote dashboard or the bound agent tools for remote files and commands. This extension does not inject a sidebar or patch pi-web.
 
+### PI-Desktop
+
+Supports [vastsa/PI-Desktop](https://github.com/vastsa/PI-Desktop) (verified against **PI-Desktop 0.22.0+**) with zero runtime npm dependencies. Three installation options are supported:
+
+1. **Install the `.piplug` plugin package (recommended)**:
+   Run `npm run build` locally (or download the `.piplug` from GitHub Releases), open PI-Desktop → **Plugins** → overflow menu **Install plugin package**, and select `release-artifacts/io.github.buptweixin.pi-remote-<version>.piplug`.
+2. **Load as a development plugin (with hot reload)**:
+   Run `npm run build`, open PI-Desktop → **Plugins** → **Load development plugin**, and select the `pi-desktop/` folder in this repository.
+3. **Import as a pi extension (agent extension only)**:
+   Open PI-Desktop → **Plugins** → overflow menu **Import pi extension**, and select the repository root (zero runtime npm dependencies; imports offline).
+
+What you get in PI-Desktop:
+
+- **In-composer SSH pill & native right Work Panel**: Mounts a native `SSH` selector pill directly inside PI-Desktop's chat composer toolbar (`composerControl` slot using host `--ds-*` tokens) with an in-window modal for switching, adding, probing, and unbinding SSH workspaces; docks a compact Light/Dark-synced **SSH Remote (`SSH 远程`)** view in the right work panel matching PI-Desktop's built-in File Manager, with collapsible file tree, colored Git diffs, click-to-open search hits, and remote bash execution.
+- **Dual-end tool coexistence**: Because PI-Desktop reserves built-in core tool names (`Read`/`Write`/`Edit`/`Bash`/`Glob`/`Grep`), binding a session automatically activates `remote_read`, `remote_write`, `remote_edit`, `remote_bash`, `remote_ls`, `remote_find`, and `remote_grep` and injects remote `AGENTS.md` / `CLAUDE.md` context while keeping local built-in tools available when needed.
+- **`/remote` slash command**: All `/remote` subcommands work natively through PI-Desktop's modal dialogs, toasts, and session status bar.
+
 ### Standalone browser dashboard
 
 Configure workspaces without starting an agent:
@@ -139,8 +156,9 @@ If pi-web runs on another server, the `/remote web` URL refers to that server's 
 
 Configuration is stored in `~/.pi/agent/remote.json` by default, with file permissions `0600`. Updates use a cross-process lock and atomic replacement.
 
-- `PI_CODING_AGENT_DIR`: override the pi configuration directory; use the same value for pi-web.
+- `PI_CODING_AGENT_DIR`: override the pi configuration directory; use the same value for pi-web and PI-Desktop.
 - `PI_REMOTE_CONFIG`: override the remote workspace configuration file path.
+- `PI_REMOTE_SESSIONS`: override the durable PI-Desktop session-binding file path (defaults to `remote-sessions.json` beside `remote.json`).
 
 ```json
 {
@@ -214,6 +232,7 @@ Release instructions, version tags, and npm Trusted Publishing setup are documen
 - [dsh-remote](https://github.com/flymysql/dsh-remote): workspace interaction reference.
 - [Pi extension documentation](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md) and [SSH example](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/examples/extensions/ssh.ts): tool delegation interfaces and implementation patterns.
 - [pi-web](https://github.com/agegr/pi-web): browser host.
+- [PI-Desktop](https://github.com/vastsa/PI-Desktop): desktop workspace host.
 
 ## License
 

@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { buildPiDesktopPlugin } from "./build-pi-desktop.mjs";
 
 const args = process.argv.slice(2);
 if (args.length && (args.length !== 2 || args[0] !== "--output-dir")) {
@@ -39,6 +40,13 @@ try {
   assert.equal(manifest.publishConfig.access, "public");
   assert.equal(manifest.repository.url, "git+https://github.com/buptweixin/pi-remote-workspaces.git");
 
+  const piplug = await buildPiDesktopPlugin({ projectDir: project, outDir: output });
+  const piplugStat = await stat(piplug.packagePath);
+  assert.equal(piplugStat.size, piplug.byteLength);
+  const piplugHeader = await readFile(piplug.packagePath);
+  assert.equal(piplugHeader.readUInt32LE(0), 0x04034b50, ".piplug must be a ZIP archive");
+  assert.equal(piplugHeader.readUInt16LE(8), 0, ".piplug must use store-only (method 0) entries");
+
   const consumer = join(scratch, "consumer");
   await mkdir(consumer);
   await writeFile(join(consumer, "package.json"), JSON.stringify({ name: "pi-remote-package-fixture", version: "1.0.0", private: true, type: "module" }));
@@ -55,7 +63,16 @@ try {
   const result = loader.getExtensions();
   assert.deepEqual(result.errors, []);
   assert.ok(result.extensions.some(extension => extension.commands.has("remote")), "Packed extension did not register /remote");
-  console.log(JSON.stringify({ package: archive.id, files: files.size, productionInstall: "passed", cli: "passed", extension: "/remote registered", tarball: args[1] ? tarball : "temporary archive removed after verification" }, null, 2));
+  console.log(JSON.stringify({
+    package: archive.id,
+    files: files.size,
+    productionInstall: "passed",
+    cli: "passed",
+    extension: "/remote registered",
+    piDesktopPlugin: piplug.fileName,
+    piDesktopSha256: piplug.shasum,
+    tarball: args[1] ? tarball : "temporary archive removed after verification",
+  }, null, 2));
 } finally {
   await rm(scratch, { recursive: true, force: true });
 }

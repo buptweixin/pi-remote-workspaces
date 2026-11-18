@@ -1,0 +1,116 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.buptweixin.pi-remote",
+  "name": "Pi Remote",
+  "version": "0.3.0",
+  "description": "内嵌于 PI-Desktop 输入框与右侧工作面板的 SSH 远程工作区：一键切换主机、浏览编辑文件、查看 Git 变更并激活 remote_* 工具。",
+  "i18n": {
+    "en": {
+      "name": "Pi Remote (SSH Workspaces)",
+      "description": "Native SSH workspace switcher in the chat composer and docked file/Git/search workbench in the right work panel, powered by your OpenSSH config.",
+      "safetyNotes": "Connects via local OpenSSH to user-configured SSH hosts; mounts an SSH selector in the chat composer and runs remote_* tools in the Agent sidecar."
+    },
+    "zh-CN": {
+      "name": "Pi Remote · SSH 远程工作区",
+      "description": "直接内嵌于聊天输入框工具栏与右侧工作面板的 SSH 远程工作区：一键绑定切换主机、浏览编辑文件、查看 Git 变更，并与本地工具共存。",
+      "safetyNotes": "通过本机 OpenSSH 连接已配置的远程主机；在聊天输入框挂载 SSH 切换胶囊并在 sidecar 中提供 remote_* 工具。"
+    }
+  },
+  "author": "Arno Wei",
+  "homepage": "https://github.com/buptweixin/pi-remote-workspaces#readme",
+  "repository": "https://github.com/buptweixin/pi-remote-workspaces",
+  "icon": "views/favicon.svg",
+  "main": "main.js",
+  "renderer": "renderer/index.mjs",
+  "rendererActions": [
+    "plugin.call"
+  ],
+  "rendererCallMethods": [
+    "remote.state",
+    "remote.bind",
+    "remote.unbind",
+    "remote.probe",
+    "remote.job",
+    "remote.saveWorkspace",
+    "remote.deleteWorkspace",
+    "remote.openView"
+  ],
+  "ui": {
+    "panel": "views/workbench.html",
+    "title": {
+      "en": "SSH Remote Workspace",
+      "zh-CN": "SSH 远程工作区"
+    },
+    "width": 980,
+    "height": 680,
+    "resizable": true
+  },
+  "contributes": {
+    "commands": [
+      {
+        "id": "pi-remote.openView",
+        "title": "Pi Remote: 打开右侧 SSH 远程工作区面板",
+        "keywords": [
+          "ssh",
+          "remote",
+          "workspace",
+          "view",
+          "远程"
+        ]
+      },
+      {
+        "id": "pi-remote.openPanel",
+        "title": "Pi Remote: 在独立窗口打开 SSH 远程工作区",
+        "keywords": [
+          "ssh",
+          "remote",
+          "panel",
+          "远程",
+          "窗口"
+        ]
+      },
+      {
+        "id": "pi-remote.unbindSession",
+        "title": "Pi Remote: 取消当前会话的 SSH 远程绑定",
+        "keywords": [
+          "ssh",
+          "remote",
+          "unbind",
+          "local",
+          "解绑"
+        ]
+      }
+    ],
+    "views": [
+      {
+        "id": "workbench",
+        "title": {
+          "en": "SSH Remote",
+          "zh-CN": "SSH 远程"
+        },
+        "icon": "server",
+        "entry": "views/workbench.html",
+        "order": 35
+      }
+    ],
+    "agentExtensions": [
+      "runtime/extension.js"
+    ]
+  },
+  "permissions": [
+    "ui.panel",
+    "ui.view",
+    "clipboard.write",
+    "renderer.extension",
+    "agent.extension"
+  ],
+  "engines": {
+    "piDesktop": ">=0.20.0"
+  },
+  "activationEvents": [
+    "onStartup",
+    "onCommand:pi-remote.openView",
+    "onCommand:pi-remote.openPanel"
+  ],
+  "license": "MIT"
+}

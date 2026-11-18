@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="pi-plugin-chrome" content="v2">
+  <title>SSH 远程工作区</title>
+  <link rel="stylesheet" href="./workbench.css">
+  <script src="./workbench.js" defer></script>
+</head>
+<body>
+  <div id="app">
+    <header class="wb-topbar">
+      <div class="wb-bar-left">
+        <button id="toggle-tree" class="wb-icon-btn" type="button" title="展开/收起文件树" aria-label="展开/收起文件树">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/></svg>
+        </button>
+        <select id="ws-select" class="wb-select" aria-label="选择远程工作区"></select>
+        <button id="ws-add" class="wb-icon-btn" type="button" title="添加 SSH 工作区" aria-label="添加 SSH 工作区">＋</button>
+        <button id="ws-edit" class="wb-icon-btn" type="button" title="编辑当前工作区" aria-label="编辑当前工作区" disabled>✎</button>
+        <button id="open-settings" class="wb-icon-btn" type="button" title="SSH 连接设置" aria-label="SSH 连接设置">⚙</button>
+      </div>
+      <div class="wb-bar-right">
+        <button id="session-chip" class="wb-chip" type="button" hidden></button>
+        <button id="probe-btn" class="wb-icon-btn" type="button" title="测试 SSH 连接" aria-label="测试 SSH 连接" disabled>⚡</button>
+        <button id="popout-btn" class="wb-icon-btn" type="button" title="在独立窗口打开" aria-label="在独立窗口打开" hidden>↗</button>
+      </div>
+    </header>
+
+    <div id="empty-view" class="wb-empty">
+      <div class="wb-empty-card">
+        <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><circle cx="6.5" cy="6.5" r="1" fill="currentColor"/><circle cx="6.5" cy="17.5" r="1" fill="currentColor"/></svg>
+        <strong>尚未配置 SSH 远程工作区</strong>
+        <p>沿用本机 <code>~/.ssh/config</code> 与 <code>ssh-agent</code>，无需在远端部署服务。</p>
+        <div id="empty-hosts" class="wb-host-pills"></div>
+        <button id="empty-add" class="wb-primary-btn" type="button">＋ 添加 SSH 工作区</button>
+      </div>
+    </div>
+
+    <div id="main-view" class="wb-main" hidden>
+      <nav class="wb-tabs" aria-label="视图切换">
+        <div class="wb-tab-group">
+          <button class="wb-tab active" type="button" data-tab="files">文件</button>
+          <button class="wb-tab" type="button" data-tab="git">变更</button>
+          <button class="wb-tab" type="button" data-tab="search">搜索</button>
+          <button class="wb-tab" type="button" data-tab="exec">终端命令</button>
+        </div>
+        <span id="conn-badge" class="wb-meta"></span>
+      </nav>
+
+      <section id="tab-files" class="wb-pane wb-files-pane">
+        <aside id="file-sidebar" class="wb-tree">
+          <div class="wb-tree-bar">
+            <button id="up-dir" class="wb-icon-btn" type="button" title="上级目录" disabled>↑</button>
+            <code id="dir-label" class="wb-path">/</code>
+            <button id="new-file" class="wb-icon-btn" type="button" title="新建文件">＋</button>
+            <button id="refresh-dir" class="wb-icon-btn" type="button" title="刷新目录">↻</button>
+          </div>
+          <div id="file-list" class="wb-tree-list"></div>
+        </aside>
+        <div class="wb-editor">
+          <div class="wb-editor-bar">
+            <code id="editor-path" class="wb-path">选择左侧文件查看或编辑</code>
+            <span id="editor-dirty" class="wb-dirty" hidden>● 未保存</span>
+            <button id="reload-file" class="wb-btn" type="button" disabled>重读</button>
+            <button id="save-file" class="wb-primary-btn" type="button" disabled>保存</button>
+          </div>
+          <div id="editor-empty" class="wb-editor-empty">
+            <span>选择远程文件以浏览或编辑</span>
+            <small>支持 ⌘/Ctrl + S 保存并校验远端版本冲突</small>
+          </div>
+          <textarea id="editor-input" class="wb-textarea" spellcheck="false" hidden></textarea>
+        </div>
+      </section>
+
+      <section id="tab-git" class="wb-pane wb-col-pane" hidden>
+        <div class="wb-subbar">
+          <div class="wb-seg">
+            <button class="wb-seg-btn active" type="button" data-git="status">状态</button>
+            <button class="wb-seg-btn" type="button" data-git="diff">工作区 Diff</button>
+            <button class="wb-seg-btn" type="button" data-git="staged">暂存区 Diff</button>
+          </div>
+          <button id="refresh-git" class="wb-icon-btn" type="button" title="刷新 Git">↻</button>
+        </div>
+        <div id="git-output" class="wb-code-view">点击上方按钮读取远程 Git 状态或差异。</div>
+      </section>
+
+      <section id="tab-search" class="wb-pane wb-col-pane" hidden>
+        <form id="search-form" class="wb-search-bar">
+          <input id="search-input" class="wb-input" placeholder="搜索内容或文件名 Glob（如 *.ts）" required>
+          <select id="search-mode" class="wb-select wb-select-compact">
+            <option value="grep">内容</option>
+            <option value="find">文件名</option>
+          </select>
+          <label class="wb-check"><input id="search-literal" type="checkbox">字面</label>
+          <label class="wb-check"><input id="search-icase" type="checkbox">忽略大小写</label>
+          <button class="wb-primary-btn" type="submit">搜索</button>
+        </form>
+        <div id="search-output" class="wb-search-results">输入关键词搜索远程工作区，点击结果可直接打开对应文件。</div>
+      </section>
+
+      <section id="tab-exec" class="wb-pane wb-col-pane" hidden>
+        <form id="exec-form" class="wb-exec-bar">
+          <input id="exec-input" class="wb-input wb-mono" placeholder="在远程工作区执行 bash 命令，例如 git status -sb" required>
+          <button id="exec-cancel" class="wb-btn" type="button" hidden>停止</button>
+          <button id="exec-run" class="wb-primary-btn" type="submit">运行</button>
+        </form>
+        <pre id="exec-output" class="wb-code-view">远程命令输出显示在这里（上限 1 MiB）。</pre>
+      </section>
+    </div>
+  </div>
+
+  <dialog id="ws-dialog" class="wb-dialog">
+    <form id="ws-form">
+      <div class="wb-dialog-head">
+        <strong id="ws-dialog-title">添加 SSH 工作区</strong>
+        <button type="button" class="wb-icon-btn" data-close="ws-dialog">✕</button>
+      </div>
+      <div class="wb-dialog-body">
+        <div id="dialog-hosts" class="wb-host-pills"></div>
+        <label class="wb-field">
+          <span>SSH 主机</span>
+          <input name="host" class="wb-input wb-mono" required placeholder="SSH config 别名或 user@hostname">
+          <small id="host-preview" class="wb-hint"></small>
+        </label>
+        <label class="wb-field">
+          <span>远程目录</span>
+          <input name="path" class="wb-input wb-mono" required placeholder="~/projects/my-app">
+        </label>
+        <label class="wb-field">
+          <span>显示名称</span>
+          <input name="name" class="wb-input" maxlength="120" placeholder="可选，默认 host:path">
+        </label>
+        <input name="id" type="hidden">
+        <p id="ws-error" class="wb-err"></p>
+      </div>
+      <div class="wb-dialog-foot">
+        <button id="ws-delete" type="button" class="wb-btn wb-danger" hidden>删除</button>
+        <span class="wb-spacer"></span>
+        <button type="button" class="wb-btn" data-close="ws-dialog">取消</button>
+        <button type="submit" class="wb-primary-btn">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="settings-dialog" class="wb-dialog">
+    <form id="settings-form">
+      <div class="wb-dialog-head">
+        <strong>SSH 连接设置</strong>
+        <button type="button" class="wb-icon-btn" data-close="settings-dialog">✕</button>
+      </div>
+      <div class="wb-dialog-body">
+        <label class="wb-field">
+          <span>自定义 SSH 配置文件（可选）</span>
+          <input name="sshConfigPath" class="wb-input wb-mono" placeholder="留空使用默认 ~/.ssh/config">
+        </label>
+        <div class="wb-row-2">
+          <label class="wb-field">
+            <span>连接超时（秒）</span>
+            <input name="connectTimeoutSeconds" class="wb-input" type="number" min="1" max="3600" required>
+          </label>
+          <label class="wb-field">
+            <span>命令超时（秒）</span>
+            <input name="commandTimeoutSeconds" class="wb-input" type="number" min="1" max="3600" required>
+          </label>
+        </div>
+        <p id="settings-error" class="wb-err"></p>
+      </div>
+      <div class="wb-dialog-foot">
+        <span class="wb-spacer"></span>
+        <button type="button" class="wb-btn" data-close="settings-dialog">取消</button>
+        <button type="submit" class="wb-primary-btn">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="newfile-dialog" class="wb-dialog">
+    <form id="newfile-form">
+      <div class="wb-dialog-head">
+        <strong>新建远程文件</strong>
+        <button type="button" class="wb-icon-btn" data-close="newfile-dialog">✕</button>
+      </div>
+      <div class="wb-dialog-body">
+        <label class="wb-field">
+          <span id="newfile-dir">相对路径</span>
+          <input name="relPath" class="wb-input wb-mono" required placeholder="src/index.ts">
+        </label>
+        <p id="newfile-error" class="wb-err"></p>
+      </div>
+      <div class="wb-dialog-foot">
+        <span class="wb-spacer"></span>
+        <button type="button" class="wb-btn" data-close="newfile-dialog">取消</button>
+        <button type="submit" class="wb-primary-btn">创建</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="wb-toast" hidden></div>
+</body>
+</html>
