@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { writeFile } from "node:fs/promises";
+import { stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { request as httpRequest } from "node:http";
 import { ConfigStore } from "../src/config.js";
+import { anchorRootDir, workspaceAnchorDir } from "../src/anchors.js";
 import { startDashboard } from "../src/server.js";
 import { RemoteClient } from "../src/remote.js";
 import { temporary, localTransport } from "./helpers.js";
@@ -25,8 +26,16 @@ test("dashboard protects its API and completes workspace/file configuration flow
   assert.equal(await withHost("127.0.0.1:30142", "http://127.0.0.1:30142"), 200);
   const html = await fetch(url.origin); assert.match(html.headers.get("content-security-policy")!, /frame-ancestors 'none'/);
   assert.match(await html.text(), /Pi Remote/);
+  const initialState = await (await request("/api/state", "GET")).json();
+  assert.equal(initialState.anchors.root, anchorRootDir(initialState.config, store.file));
+  assert.ok((await stat(initialState.anchors.root)).isDirectory());
   let response = await request("/api/workspaces", "POST", { id: "demo", name: "Demo", host: "fixture", path: root });
   assert.equal(response.status, 201);
+  const createdDemo = await response.json();
+  assert.equal(createdDemo.anchorDir, workspaceAnchorDir("demo", undefined, store.file));
+  assert.ok((await stat(createdDemo.anchorDir)).isDirectory());
+  const stateWithDemo = await (await request("/api/state", "GET")).json();
+  assert.equal(stateWithDemo.anchors.workspaces.demo, createdDemo.anchorDir);
   response = await request("/api/workspaces", "POST", { id: "demo", name: "Duplicate", host: "fixture", path: root });
   assert.equal(response.status, 400);
   await writeFile(join(root, "hello.txt"), "hello");
@@ -38,8 +47,14 @@ test("dashboard protects its API and completes workspace/file configuration flow
   assert.equal(response.status, 400); assert.match((await response.json()).error, /conflict/);
   response = await request("/api/workspaces/demo/read", "POST", { path: "../outside" });
   assert.equal(response.status, 400);
-  response = await request("/api/config", "PUT", { connectTimeoutSeconds: 20, commandTimeoutSeconds: 180 });
+  response = await request("/api/config", "PUT", { connectTimeoutSeconds: 20, commandTimeoutSeconds: 180, anchorRoot: "relative/path" });
+  assert.equal(response.status, 400);
+  const customAnchorRoot = join(root, "custom-anchors");
+  response = await request("/api/config", "PUT", { connectTimeoutSeconds: 20, commandTimeoutSeconds: 180, anchorRoot: customAnchorRoot });
   assert.equal(response.status, 200); assert.equal((await store.read()).workspaces.length, 1);
+  assert.ok((await stat(workspaceAnchorDir("demo", { anchorRoot: customAnchorRoot }, store.file))).isDirectory());
+  response = await request("/api/config", "PUT", { connectTimeoutSeconds: 20, commandTimeoutSeconds: 180 });
+  assert.equal(response.status, 200);
   // Create-only write (etag: null) succeeds for new files and rejects existing files.
   response = await request("/api/workspaces/demo/write", "POST", { path: "brand-new.txt", content: "created", etag: null });
   assert.equal(response.status, 200);
@@ -53,5 +68,6 @@ test("dashboard protects its API and completes workspace/file configuration flow
   assert.equal(autoSlug.id, "staging-api");
   assert.equal((await request("/api/workspaces/staging-api", "DELETE")).status, 200);
   assert.equal((await request("/api/workspaces/demo", "DELETE")).status, 200);
+  await assert.rejects(stat(createdDemo.anchorDir), /ENOENT/);
   assert.equal((await store.read()).workspaces.length, 0);
 });

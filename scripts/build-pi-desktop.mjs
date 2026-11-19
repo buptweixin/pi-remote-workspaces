@@ -43,6 +43,7 @@ const PERMISSION_API_HINTS = {
 };
 const RUNTIME_FILES = [
   "config.js",
+  "anchors.js",
   "process.js",
   "ssh-config.js",
   "remote-script.js",

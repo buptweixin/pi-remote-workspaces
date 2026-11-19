@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { join } from "node:path";
+import { ensureWorkspaceAnchor } from "../src/anchors.js";
 import { sshFixture } from "./ssh-fixture.js";
 
 test("npx pi-web loads the package, serves /remote dialogs and binds real SSH workspaces", { skip: process.env.PI_REMOTE_TEST_PI_WEB !== "1", timeout: 180_000 }, async t => {
@@ -76,5 +77,32 @@ test("npx pi-web loads the package, serves /remote dialogs and binds real SSH wo
     await new Promise(resolve => setTimeout(resolve, 50));
   }
   assert.match(captured, /SSH: 本地/);
+
+  const anchorDir = await ensureWorkspaceAnchor("test", fixture.config, fixture.store.file);
+  const anchored = await post("/api/agent/new", { cwd: anchorDir, type: "ensure_session" });
+  const anchoredId = anchored.sessionId; assert.ok(anchoredId);
+  const anchoredController = new AbortController();
+  const anchoredEvents = await fetch(`${origin}/api/agent/${anchoredId}/events`, { signal: anchoredController.signal });
+  const anchoredReader = anchoredEvents.body!.getReader(); let anchoredCaptured = "";
+  const anchoredReading = (async () => {
+    try { while (true) { const value = await anchoredReader.read(); if (value.done) break; anchoredCaptured += Buffer.from(value.value).toString(); } } catch {}
+  })();
+  t.after(async () => { anchoredController.abort(); await anchoredReading; });
+  await post(`/api/agent/${anchoredId}`, { type: "prompt", message: "/remote status" });
+  for (let attempt = 0; attempt < 40 && !anchoredCaptured.includes("Python"); attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  assert.match(anchoredCaptured, /fixture:/);
+  assert.match(anchoredCaptured, /Python/);
+  const anchoredStateRes = await fetch(`${origin}/api/agent/${anchoredId}`, { signal: AbortSignal.timeout(10_000) });
+  assert.equal(anchoredStateRes.status, 200);
+  const anchoredState = await anchoredStateRes.json() as {
+    running?: boolean;
+    state?: { extensionStatuses?: Array<{ key: string; text: string }> };
+  };
+  assert.equal(anchoredState.running, true);
+  const statusMap = new Map((anchoredState.state?.extensionStatuses ?? []).map(item => [item.key, item.text]));
+  assert.match(statusMap.get("command:/remote") ?? "", /^● SSH fixture · /);
+  assert.equal(statusMap.get("command:/remote files"), "远程文件");
   assert.doesNotMatch(logs, /Failed to load extension|Cannot find module|Extension load error/);
 });

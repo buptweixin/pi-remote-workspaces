@@ -88,6 +88,7 @@ The extension menus and dashboard currently use Simplified Chinese. Command name
 /remote edit [id]        Edit a saved workspace configuration
 /remote remove my-app    Remove a saved workspace configuration
 /remote hosts            Reload SSH config and show or import host aliases
+/remote anchors          Sync and print pi-web remote anchor directory paths
 /remote use my-app-dev   Bind this session to a saved workspace
 /remote files [path]     Browse, search, create, and edit remote files in native modals
 /remote git              Inspect remote Git status and diffs in native modals
@@ -109,7 +110,10 @@ npx @agegr/pi-web@latest
 
 Native `pi-web` UI integration works out of the box without patching `pi-web`:
 
-- **Clickable status-shelf toolbar buttons (`ExtensionStatusBar` `command:` protocol)**: Shows a clickable **`SSH: 本地`** button right below the chat input when unbound (opening the native workspace switcher/creator modal with one click, no typing `/remote` needed), and **`● SSH <host> · <path>`**, **`远程文件`**, **`Git 状态`**, **`探测连接`**, and **`切回本地`** buttons plus a collapsible ANSI details drawer (`▲ pi-remote`) when bound.
+- **Clickable status-shelf toolbar buttons (`ExtensionStatusBar` `command:` protocol)**: Shows a clickable **`SSH: 本地`** button right below the chat input when unbound (opening the native workspace switcher/creator modal with one click, no typing `/remote` needed), and **`● SSH <host> · <path>`**, **`远程文件`**, **`Git 状态`**, **`探测连接`**, and **`切回本地`** buttons plus a collapsible ANSI details drawer (`▲ pi-remote`) when bound. Note: `pi-web` lazily spawns an agent runtime only on the first prompt or `/` command lookup, so an untouched empty composer will not show extension status buttons until that first interaction.
+- **Connect without piggybacking on a local project (remote anchor directories)**: Automatically maintains empty local anchor directories under `~/.pi/remote-workspaces` (viewable via `/remote anchors`, `pi-remote anchors`, or copy buttons in the dashboard):
+  - Opening a **workspace anchor** `~/.pi/remote-workspaces/<workspace-id>` automatically binds that SSH workspace during `session_start` without running `/remote use` first (and can be pinned in `pi-web`'s sidebar).
+  - Opening the **shared picker anchor** `~/.pi/remote-workspaces` automatically opens an SSH workspace selector on your first message or `/`.
 - **In-page native modal file browser/editor & Git inspector**: Click **`远程文件`** (`/remote files`) to navigate remote directories, run `find`/`grep` searches, create files, or edit and atomically save remote UTF-8 files (with optimistic `etag` conflict checks) inside `pi-web`'s built-in monospace editor modal; click **`Git 状态`** (`/remote git`) to inspect dirty files and per-file or full diffs.
 - **Official session-liveness integration (`@agegr/pi-web/session-liveness/v1`)**: Registers a session-scoped liveness lease so active interactive flows or an open `/remote web` standalone dashboard are not evicted by `pi-web`'s 10-minute idle timer.
 
@@ -165,6 +169,7 @@ Configuration is stored in `~/.pi/agent/remote.json` by default, with file permi
 
 - `PI_CODING_AGENT_DIR`: override the pi configuration directory; use the same value for pi-web and PI-Desktop.
 - `PI_REMOTE_CONFIG`: override the remote workspace configuration file path.
+- `PI_REMOTE_ANCHOR_DIR`: override the local pi-web anchor root directory (defaults to `~/.pi/remote-workspaces`, or `<dirname(PI_REMOTE_CONFIG)>/remote-workspaces` when `PI_REMOTE_CONFIG` / `PI_CODING_AGENT_DIR` is customized).
 - `PI_REMOTE_SESSIONS`: override the durable PI-Desktop session-binding file path (defaults to `remote-sessions.json` beside `remote.json`).
 
 ```json
@@ -183,7 +188,7 @@ Configuration is stored in `~/.pi/agent/remote.json` by default, with file permi
 }
 ```
 
-The optional `sshConfigPath` must be an **absolute path** to a custom SSH configuration file. Leave it unset to use OpenSSH's default configuration. Setting it passes `ssh -F`, which disables the system configuration. Host discovery follows the same file-selection rules. Relative `Include` paths are resolved against the user's `~/.ssh` or the system's `/etc/ssh`, as appropriate.
+The optional `sshConfigPath` and `anchorRoot` fields must be **absolute paths**. Leave `sshConfigPath` unset to use OpenSSH's default configuration; setting it passes `ssh -F`, which disables the system configuration. Host discovery follows the same file-selection rules. Relative `Include` paths are resolved against the user's `~/.ssh` or the system's `/etc/ssh`, as appropriate. Leave `anchorRoot` unset to use the default anchor root.
 
 Refreshing the host list rereads configuration files and their includes. Each SSH operation applies the current OpenSSH connection configuration, so changes do not require a restart. Wildcard and negated aliases such as `Host *` and `Host *.example.com` are not listed; enter a concrete hostname manually instead. Discovery scans declarations without executing `Match exec`. OpenSSH evaluates effective settings when connecting or explicitly resolving a host. Aliases discovered in conditional includes remain candidates whose connectivity depends on those rules.
 
@@ -191,7 +196,8 @@ Refreshing the host list rereads configuration files and their includes. Each SS
 
 ```sh
 node dist/cli.js hosts          # SSH aliases and source locations
-node dist/cli.js list           # Saved workspaces
+node dist/cli.js list           # Saved workspaces and anchor paths
+node dist/cli.js anchors        # Sync and print pi-web anchor paths
 node dist/cli.js test my-app-dev
 node dist/cli.js remove my-app-dev
 node dist/cli.js --help

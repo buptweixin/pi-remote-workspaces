@@ -7,6 +7,7 @@ export interface Workspace { id: string; name: string; host: string; path: strin
 export interface RemoteConfig {
   version: 1;
   sshConfigPath?: string;
+  anchorRoot?: string;
   connectTimeoutSeconds: number;
   commandTimeoutSeconds: number;
   workspaces: Workspace[];
@@ -138,6 +139,10 @@ export function validateConfig(value: unknown): RemoteConfig {
   if (sshConfigPath !== undefined && (typeof sshConfigPath !== "string" || !sshConfigPath || !sshConfigPath.startsWith("/") || /[\0\r\n]/.test(sshConfigPath))) {
     throw new Error("sshConfigPath must be an absolute path, or omitted for the system default");
   }
+  const anchorRoot = typeof v.anchorRoot === "string" ? v.anchorRoot.trim() : v.anchorRoot;
+  if (anchorRoot !== undefined && (typeof anchorRoot !== "string" || !anchorRoot || !anchorRoot.startsWith("/") || /[\0\r\n]/.test(anchorRoot))) {
+    throw new Error("anchorRoot must be an absolute path, or omitted for the default");
+  }
   const ids = new Set<string>();
   for (const w of v.workspaces) {
     if (!w || typeof w.id !== "string" || !/^[a-zA-Z0-9_-]{1,80}$/.test(w.id) || ids.has(w.id)) throw new Error("Workspace IDs must be unique, using letters, digits, _ or -");
@@ -146,7 +151,7 @@ export function validateConfig(value: unknown): RemoteConfig {
     if (typeof w.name !== "string" || !w.name.trim() || w.name.length > 120) throw new Error("Workspace name is required (max 120 characters)");
     if (typeof w.path !== "string" || !/^(\/|~(?:\/|$))/.test(w.path) || /[\0\r\n]/.test(w.path)) throw new Error("Remote path must be absolute or start with ~/ (no control characters)");
   }
-  return { version: 1, sshConfigPath, connectTimeoutSeconds: v.connectTimeoutSeconds, commandTimeoutSeconds: v.commandTimeoutSeconds, workspaces: v.workspaces.map(w => ({ id: w.id, name: w.name.trim(), host: w.host, path: w.path })) };
+  return { version: 1, sshConfigPath, anchorRoot, connectTimeoutSeconds: v.connectTimeoutSeconds, commandTimeoutSeconds: v.commandTimeoutSeconds, workspaces: v.workspaces.map(w => ({ id: w.id, name: w.name.trim(), host: w.host, path: w.path })) };
 }
 
 export function parsePersistedSessionState(value: unknown): PersistedSessionState {

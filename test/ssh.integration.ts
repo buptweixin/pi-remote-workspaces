@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { anchorRootDir, ensureWorkspaceAnchor, workspaceAnchorDir } from "../src/anchors.js";
 import { createRemoteTools } from "../src/tools.js";
 import { RemoteClient, RemotePool } from "../src/remote.js";
 import { discoverHosts } from "../src/ssh-config.js";
 import { sshFixture } from "./ssh-fixture.js";
-import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager, type ExtensionToolContext } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager, type ExtensionToolContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 
 test("real OpenSSH transport, actual SDK loading, session binding and isolation", { timeout: 60_000 }, async t => {
   const fixture = await sshFixture(t);
@@ -22,33 +23,71 @@ test("real OpenSSH transport, actual SDK loading, session binding and isolation"
   process.env.PI_REMOTE_CONFIG = fixture.store.file;
   t.after(() => { if (oldConfig === undefined) delete process.env.PI_REMOTE_CONFIG; else process.env.PI_REMOTE_CONFIG = oldConfig; });
   const notices: string[] = [];
-  async function session(manager = SessionManager.inMemory(fixture.root), remoteId?: string) {
+  interface SessionHandle {
+    session: Awaited<ReturnType<typeof createAgentSession>>["session"];
+    statuses: Map<string, string | undefined>;
+    widgets: Map<string, unknown>;
+  }
+  async function openSession(options: {
+    manager?: SessionManager;
+    remoteId?: string;
+    cwd?: string;
+    ui?: Partial<ExtensionUIContext> | null;
+  } = {}): Promise<SessionHandle> {
+    const cwd = options.cwd ?? fixture.root;
+    const manager = options.manager ?? SessionManager.inMemory(cwd);
     const settingsManager = SettingsManager.inMemory({ defaultTools: ["read", "write", "edit", "bash", "grep", "find", "ls"] });
-    const loader = new DefaultResourceLoader({ cwd: fixture.root, agentDir: join(fixture.root, "agent"), settingsManager, noSkills: true, noPromptTemplates: true, noThemes: true, additionalExtensionPaths: [join(process.cwd(), "src/extension.ts")] });
+    const loader = new DefaultResourceLoader({ cwd, agentDir: join(fixture.root, "agent"), settingsManager, noSkills: true, noPromptTemplates: true, noThemes: true, additionalExtensionPaths: [join(process.cwd(), "src/extension.ts")] });
     await loader.reload();
     assert.deepEqual(loader.getExtensions().errors, []);
-    const { session: result } = await createAgentSession({ cwd: fixture.root, agentDir: join(fixture.root, "agent"), settingsManager, resourceLoader: loader, sessionManager: manager });
-    if (remoteId) result.extensionRunner.setFlagValue("remote", remoteId);
-    await result.bindExtensions({ mode: "rpc", uiContext: { ...result.extensionRunner.getUIContext(), notify: message => notices.push(message), setStatus: () => {}, setWidget: () => {} } });
+    const { session: result } = await createAgentSession({ cwd, agentDir: join(fixture.root, "agent"), settingsManager, resourceLoader: loader, sessionManager: manager });
+    if (options.remoteId) result.extensionRunner.setFlagValue("remote", options.remoteId);
+    const statuses = new Map<string, string | undefined>();
+    const widgets = new Map<string, unknown>();
+    if (options.ui === null) {
+      await result.bindExtensions({});
+    } else {
+      await result.bindExtensions({
+        mode: "rpc",
+        uiContext: {
+          ...result.extensionRunner.getUIContext(),
+          notify: message => notices.push(message),
+          setStatus: (key, text) => { statuses.set(key, text); },
+          setWidget: (key, content) => { widgets.set(key, content); },
+          ...options.ui,
+        },
+      });
+    }
     t.after(async () => {
       await result.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
       result.dispose();
     });
-    return result;
+    return { session: result, statuses, widgets };
   }
-  const first = await session();
+  async function session(manager = SessionManager.inMemory(fixture.root), remoteId?: string) {
+    return (await openSession({ manager, remoteId })).session;
+  }
+  const firstHandle = await openSession();
+  const first = firstHandle.session;
+  assert.equal(firstHandle.statuses.get("pi-remote"), undefined);
   await first.prompt("/remote use test");
   assert.match(notices.at(-1)!, /已绑定/);
+  assert.match(firstHandle.statuses.get("pi-remote")!, /^SSH fixture · /);
+  await first.prompt("/remote anchors");
+  assert.match(notices.at(-1)!, /锚点目录已同步/);
   assert.equal(first.sessionManager.getBranch().filter(e => e.type === "custom").length, 1);
   assert.deepEqual(first.getAllTools().filter(tool => ["read", "write", "edit", "bash", "grep", "find", "ls"].includes(tool.name)).length, 7);
   const second = await session();
   assert.equal(second.sessionManager.getBranch().filter(e => e.type === "custom").length, 0);
   await second.prompt("/remote status");
   assert.match(notices.at(-1)!, /本地/);
-  const blocked = await session(undefined, "does-not-exist");
+  const blockedHandle = await openSession({ remoteId: "does-not-exist" });
+  const blocked = blockedHandle.session;
+  assert.match(blockedHandle.statuses.get("pi-remote")!, /^SSH blocked:/);
   const blockedRead = blocked.agent.state.tools.find(tool => tool.name === "read")!;
   await assert.rejects(blockedRead.execute("blocked-read", { path: "actual-ssh.txt" }, undefined), /Remote workspace unavailable/);
   await blocked.prompt("/remote local");
+  assert.equal(blockedHandle.statuses.get("pi-remote"), undefined);
   const localRead = await blockedRead.execute("explicit-local", { path: "actual-ssh.txt" }, undefined);
   assert.match(JSON.stringify(localRead), /SSH transport works/);
   await first.prompt("/remote status");
@@ -110,6 +149,59 @@ test("real OpenSSH transport, actual SDK loading, session binding and isolation"
 
   await isolated.prompt("/remote remove remote-repo");
   assert.ok(!(await fixture.store.read()).workspaces.some(w => w.id === "remote-repo"));
+
+  // Per-workspace anchor auto-bind, saved local override on resume, unknown anchor, and shared picker root flows.
+  const testAnchor = await ensureWorkspaceAnchor("test", fixture.config, fixture.store.file);
+  assert.equal(testAnchor, workspaceAnchorDir("test", fixture.config, fixture.store.file));
+  const anchored = await openSession({ cwd: testAnchor });
+  assert.match(anchored.statuses.get("pi-remote")!, /^SSH fixture · /);
+  assert.equal(anchored.session.sessionManager.getBranch().filter(e => e.type === "custom").length, 1);
+  const anchoredRead = anchored.session.agent.state.tools.find(tool => tool.name === "read")!;
+  assert.match(JSON.stringify(await anchoredRead.execute("anchor-read", { path: "actual-ssh.txt" }, undefined)), /SSH transport works/);
+
+  await anchored.session.prompt("/remote local");
+  assert.equal(anchored.statuses.get("pi-remote"), undefined);
+  const anchoredResumed = await openSession({ manager: anchored.session.sessionManager, cwd: testAnchor });
+  assert.equal(anchoredResumed.statuses.get("pi-remote"), undefined);
+  await anchoredResumed.session.prompt("/remote status");
+  assert.match(notices.at(-1)!, /本地/);
+
+  const pickerRoot = anchorRootDir(fixture.config, fixture.store.file);
+  const unknownAnchor = join(pickerRoot, "deleted-ws");
+  await mkdir(unknownAnchor, { recursive: true });
+  const unknownSession = await openSession({ cwd: unknownAnchor });
+  assert.match(unknownSession.statuses.get("pi-remote")!, /^SSH blocked:/);
+  const unknownRead = unknownSession.session.agent.state.tools.find(tool => tool.name === "read")!;
+  await assert.rejects(unknownRead.execute("unknown-anchor-read", { path: "actual-ssh.txt" }, undefined), /Remote workspace unavailable/);
+
+  const pickerSelected = await openSession({
+    cwd: pickerRoot,
+    ui: { select: async (_title, opts) => opts.find(opt => opt.includes("[test]")) },
+  });
+  assert.match(pickerSelected.statuses.get("pi-remote")!, /^SSH fixture · /);
+
+  const pickerCancelled = await openSession({
+    cwd: pickerRoot,
+    ui: { select: async () => undefined },
+  });
+  assert.match(pickerCancelled.statuses.get("pi-remote")!, /^SSH blocked:/);
+  assert.equal(pickerCancelled.session.sessionManager.getBranch().filter(e => e.type === "custom").length, 0);
+  const cancelledRead = pickerCancelled.session.agent.state.tools.find(tool => tool.name === "read")!;
+  await assert.rejects(cancelledRead.execute("picker-cancel-read", { path: "actual-ssh.txt" }, undefined), /Remote workspace unavailable/);
+  await pickerCancelled.session.prompt("/remote use test");
+  assert.match(pickerCancelled.statuses.get("pi-remote")!, /^SSH fixture · /);
+
+  const pickerLocal = await openSession({
+    cwd: pickerRoot,
+    ui: { select: async () => "🔌 暂不绑定（仅本地）" },
+  });
+  assert.equal(pickerLocal.statuses.get("pi-remote"), undefined);
+  assert.equal(pickerLocal.session.sessionManager.getBranch().filter(e => e.type === "custom").length, 1);
+
+  const pickerHeadless = await openSession({ cwd: pickerRoot, ui: null });
+  const headlessRead = pickerHeadless.session.agent.state.tools.find(tool => tool.name === "read")!;
+  await assert.rejects(headlessRead.execute("picker-headless-read", { path: "actual-ssh.txt" }, undefined), /Remote workspace unavailable/);
+
   await Promise.all([
     pool.close(),
     isolated.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }),

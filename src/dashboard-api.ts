@@ -4,6 +4,7 @@ import {
   ConfigStore, SessionBindingStore, sessionStateFile, slugifyWorkspaceId,
   validateConfig, validateHost, type PersistedSessionState, type RemoteConfig, type Workspace,
 } from "./config.js";
+import { ensureWorkspaceAnchor, removeWorkspaceAnchorIfEmpty, syncWorkspaceAnchors } from "./anchors.js";
 import { discoverHosts, resolveHost } from "./ssh-config.js";
 import { RemoteClient, RemotePool, type Probe } from "./remote.js";
 
@@ -90,17 +91,21 @@ export class DashboardController {
     try {
       const config = await this.store.read();
       if (pathname === "/api/state" && method === "GET") {
-        return { status: 200, body: { version: packageVersion, config, inventory: await discoverHosts(config), configFile: this.store.file } };
+        const anchors = await syncWorkspaceAnchors(config, this.store.file);
+        return { status: 200, body: { version: packageVersion, config, inventory: await discoverHosts(config), configFile: this.store.file, anchors } };
       }
       if (pathname === "/api/config" && method === "PUT") {
         const sshConfigPath = typeof input.sshConfigPath === "string" ? input.sshConfigPath.trim() : input.sshConfigPath;
+        const anchorRoot = typeof input.anchorRoot === "string" ? input.anchorRoot.trim() : input.anchorRoot;
         const next = await this.store.update(current => validateConfig({
           ...current,
           sshConfigPath: sshConfigPath || undefined,
+          anchorRoot: anchorRoot || undefined,
           connectTimeoutSeconds: input.connectTimeoutSeconds,
           commandTimeoutSeconds: input.commandTimeoutSeconds,
         }));
         await this.pool.closeHost();
+        await syncWorkspaceAnchors(next, this.store.file).catch(() => {});
         return { status: 200, body: next };
       }
       if (pathname === "/api/workspaces" && method === "POST") {
@@ -109,12 +114,13 @@ export class DashboardController {
         const name = typeof input.name === "string" ? input.name.trim() : input.name;
         const requestedId = typeof input.id === "string" ? input.id.trim() : input.id;
         let created!: Workspace;
-        await this.store.update(current => {
+        const updated = await this.store.update(current => {
           const id = requestedId || (typeof host === "string" && typeof path === "string" ? slugifyWorkspaceId(host, path, typeof name === "string" ? name : undefined, current.workspaces.map(w => w.id)) : randomBytes(6).toString("hex"));
           created = { id, name, host, path } as Workspace;
           return { ...current, workspaces: [...current.workspaces, created] };
         });
-        return { status: 201, body: created };
+        const anchorDir = await ensureWorkspaceAnchor(created.id, updated, this.store.file);
+        return { status: 201, body: { ...created, anchorDir } };
       }
       if (pathname === "/api/resolve" && method === "POST") {
         const host = typeof input.host === "string" ? input.host.trim() : input.host;
@@ -130,6 +136,7 @@ export class DashboardController {
       if (!match[2] && method === "DELETE") {
         await this.store.update(current => ({ ...current, workspaces: current.workspaces.filter(w => w.id !== workspace.id) }));
         await this.sessionStore.clearWorkspace(workspace.id);
+        await removeWorkspaceAnchorIfEmpty(workspace.id, config, this.store.file);
         await this.pool.closeHost(workspace.host);
         return { status: 200, body: { ok: true } };
       }

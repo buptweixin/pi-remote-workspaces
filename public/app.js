@@ -117,6 +117,7 @@ async function refresh() {
   $("ssh-aliases").replaceChildren(...state.inventory.hosts.map(host => { const option = node("option"); option.value = host.alias; return option; }));
   $("hosts").replaceChildren(...state.inventory.hosts.map(host => { const row = node("div", undefined, "host-row"); const button = node("button", host.alias); button.title = `${host.source}:${host.line}`; button.onclick = () => openWorkspace(undefined, host.alias); row.append(button); return row; }));
   if (!state.inventory.hosts.length) $("hosts").append(node("p", "尚未发现主机，可手动添加。", "hint"));
+  $("copy-shared-anchor").title = state.anchors?.root || "";
   if (selected) selected = state.config.workspaces.find(w => w.id === selected.id);
   await refreshDesktopSession();
   renderWorkspaces();
@@ -133,6 +134,10 @@ function renderWorkspaces() {
   $("test-connection").disabled = !active; $("edit-workspace").disabled = !active;
   $("workspace-title").textContent = selected?.name || "远程工作区";
   $("workspace-subtitle").textContent = selected ? `${selected.host} / ${selected.path}` : "从 SSH 配置开始，让 pi 在远程项目中工作。";
+  if (selected) {
+    $("copy-anchor").textContent = "复制 pi-web 锚点目录  ⧉";
+    $("copy-anchor").title = state.anchors?.workspaces?.[selected.id] || "";
+  }
   renderSessionBar();
 }
 async function selectWorkspace(workspace) {
@@ -235,7 +240,7 @@ $("delete-workspace").onclick = perform(async () => {
 });
 $("refresh-hosts").onclick = perform(async () => { await refresh(); toast(`已重新读取 ${state.inventory.files.length} 份 SSH 配置`); });
 $("open-settings").onclick = () => {
-  for (const name of ["sshConfigPath", "connectTimeoutSeconds", "commandTimeoutSeconds"]) $("settings-form").elements.namedItem(name).value = state.config[name] ?? "";
+  for (const name of ["sshConfigPath", "anchorRoot", "connectTimeoutSeconds", "commandTimeoutSeconds"]) $("settings-form").elements.namedItem(name).value = state.config[name] ?? "";
   $("settings-error").textContent = ""; $("settings-dialog").showModal();
 };
 $("settings-form").onsubmit = async event => {
@@ -253,6 +258,18 @@ $("test-connection").onclick = perform(async () => {
   } catch (error) { if (selected?.id === id) { $("connection-state").textContent = "连接失败"; $("connection-state").className = "badge"; } throw error; }
 });
 $("copy-command").onclick = perform(async () => { await copyText(`/remote use ${selected.id}`); toast("绑定命令已复制"); });
+$("copy-anchor").onclick = perform(async () => {
+  const dir = state.anchors?.workspaces?.[selected.id];
+  if (!dir) throw new Error("未找到工作区锚点目录");
+  await copyText(dir);
+  toast("pi-web 锚点目录已复制，在 pi-web 打开该目录即可自动绑定");
+});
+$("copy-shared-anchor").onclick = perform(async () => {
+  const dir = state.anchors?.root;
+  if (!dir) throw new Error("未找到共享选服目录");
+  await copyText(dir);
+  toast("pi-web 共享选服目录已复制");
+});
 $("bind-session").onclick = perform(async () => {
   if (!desktopBridge || !selected) return;
   $("bind-session").disabled = true;

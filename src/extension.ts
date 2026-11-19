@@ -1,9 +1,11 @@
 // SSH tool override patterns reference pi's MIT-licensed example; see THIRD_PARTY_NOTICES.md.
+import { dirname, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
   agentDir, ConfigStore, parsePersistedSessionState, SessionBindingStore, sessionStateFile,
-  slugifyWorkspaceId, validateHost, type PersistedBinding, type PersistedSessionState,
+  slugifyWorkspaceId, validateHost, type PersistedBinding, type PersistedSessionState, type RemoteConfig, type Workspace,
 } from "./config.js";
+import { ensureWorkspaceAnchor, matchAnchorCwd, removeWorkspaceAnchorIfEmpty, syncWorkspaceAnchors } from "./anchors.js";
 import { discoverHosts } from "./ssh-config.js";
 import { RemoteClient, RemotePool, type RemoteContextFile } from "./remote.js";
 import {
@@ -27,6 +29,7 @@ const SUBCOMMANDS: ReadonlyArray<[string, string]> = [
   ["edit ", "编辑已保存的远程工作区配置"],
   ["remove ", "删除已保存的远程工作区配置"],
   ["hosts", "重新读取 SSH config 并显示或导入主机"],
+  ["anchors", "查看并同步 pi-web 远程锚点目录路径"],
   ["status", "查看当前工作区并检查连接"],
   ["test", "测试当前远程连接与工具可用性"],
   ["web", "打开本会话的独立浏览器工作台"],
@@ -114,16 +117,19 @@ export default function remoteExtension(pi: ExtensionAPI) {
     await persist(ctx);
     ctx.ui.notify(`已绑定 ${workspace.name}: ${workspace.host}:${probe.root}`, "info");
   };
-  const restore = async (ctx: ExtensionContext) => {
+  const restore = async (ctx: ExtensionContext): Promise<boolean> => {
+    let hasSavedBinding = false;
     if (nativeMode) {
       state = { mode: "local" };
       for (const entry of ctx.sessionManager.getBranch()) {
         if (entry.type !== "custom" || entry.customType !== ENTRY) continue;
+        hasSavedBinding = true;
         state = parsePersistedSessionState(entry.data);
       }
     } else {
       const prevHost = state.mode === "remote" ? state.binding.workspace.host : undefined;
       const saved = await sessionStore.get(sessionIdOf(ctx));
+      hasSavedBinding = saved !== undefined;
       state = saved ?? { mode: "local" };
       const nextHost = state.mode === "remote" ? state.binding.workspace.host : undefined;
       if (prevHost && prevHost !== nextHost) await pool.closeHost(prevHost);
@@ -131,6 +137,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
     }
     if (state.mode !== "remote") remoteContextCache = undefined;
     display(ctx);
+    return hasSavedBinding;
   };
 
   if (nativeMode) {
@@ -172,7 +179,9 @@ export default function remoteExtension(pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
-    await restore(ctx);
+    const hasSavedBinding = await restore(ctx);
+    const config = await store.read().catch(() => undefined);
+    if (config) await syncWorkspaceAnchors(config, store.file).catch(() => {});
     const id = pi.getFlag("remote");
     if (!flagApplied && typeof id === "string" && id) {
       flagApplied = true;
@@ -182,6 +191,23 @@ export default function remoteExtension(pi: ExtensionAPI) {
         await persist(ctx);
         ctx.ui.notify(state.error, "error");
       }
+      return;
+    }
+    if (!nativeMode || !config || hasSavedBinding) return;
+    const anchor = await matchAnchorCwd(ctx.cwd, config, store.file).catch(() => ({ kind: "none" as const }));
+    if (anchor.kind === "workspace") {
+      try { await bind(anchor.workspace.id, ctx); }
+      catch (error) {
+        state = { mode: "blocked", error: (error as Error).message };
+        await persist(ctx);
+        ctx.ui.notify(state.error, "error");
+      }
+    } else if (anchor.kind === "unknown-workspace") {
+      state = { mode: "blocked", error: `Unknown workspace anchor: ${anchor.id}. Use /remote to select a workspace or /remote local.` };
+      await persist(ctx);
+      ctx.ui.notify(state.error, "error");
+    } else if (anchor.kind === "picker") {
+      await withInteractiveLease(ctx, () => openPickerOnStart(ctx, config));
     }
   });
   if (nativeMode) {
@@ -262,8 +288,8 @@ export default function remoteExtension(pi: ExtensionAPI) {
     if (state.mode === "local") return;
     const { workspace, probe } = state.binding;
     const files = await loadRemoteContext(workspace.host, probe.root, workspace);
-    const globalPrefix = `${agentDir().replace(/\/+$/, "")}/`;
-    const globalContext = event.systemPromptOptions.contextFiles.filter(file => file.path.startsWith(globalPrefix));
+    const globalDir = resolve(agentDir());
+    const globalContext = event.systemPromptOptions.contextFiles.filter(file => dirname(resolve(file.path)) === globalDir);
     event.systemPromptOptions.cwd = probe.root;
     event.systemPromptOptions.contextFiles = [...globalContext, ...files];
     event.systemPromptOptions.sections.ssh_workspace = [
@@ -290,30 +316,36 @@ export default function remoteExtension(pi: ExtensionAPI) {
       ctx.ui.notify(`Pi Remote 管理界面：${url}（也可直接使用右侧工作面板「SSH 远程工作区」视图）`, "info");
     }
   };
-  const add = async (ctx: ExtensionCommandContext, presetHost?: string) => {
+  const formatWorkspaceChoice = (workspace: Workspace, activeId?: string) => (
+    `${workspace.id === activeId ? "● " : ""}${workspace.name} — ${workspace.host}:${workspace.path} [${workspace.id}]`
+  );
+  const add = async (ctx: ExtensionContext, presetHost?: string): Promise<boolean> => {
     const config = await store.read();
     let host = presetHost;
     if (!host) {
       const inventory = await discoverHosts(config);
       const manual = "手动输入 SSH 主机";
       const selected = await ctx.ui.select("选择 SSH 主机（动态读取 config）", [...inventory.hosts.map(h => h.alias), manual]);
-      if (!selected) return;
+      if (!selected) return false;
       host = (selected === manual ? await ctx.ui.input("SSH 主机", "例如 dev 或 user@example.com") : selected)?.trim();
     }
-    if (!host) return;
+    if (!host) return false;
     validateHost(host);
     const rawPath = await ctx.ui.input("远程项目目录", "例如 ~/projects/my-app");
     const path = rawPath?.trim();
-    if (!path) return;
+    if (!path) return false;
     const rawName = await ctx.ui.input("工作区名称", `${host}:${path}`);
-    if (rawName === undefined) return;
+    if (rawName === undefined) return false;
     const name = rawName.trim() || `${host}:${path}`;
-    const workspace = await store.update(current => {
+    const updated = await store.update(current => {
       const id = slugifyWorkspaceId(host!, path, rawName.trim() || undefined, current.workspaces.map(w => w.id));
       return { ...current, workspaces: [...current.workspaces, { id, name, host: host!, path }] };
-    }).then(updated => updated.workspaces.at(-1)!);
+    });
+    const workspace = updated.workspaces.at(-1)!;
+    await ensureWorkspaceAnchor(workspace.id, updated, store.file).catch(() => {});
     ctx.ui.notify(`已保存 ${workspace.name} (${workspace.id})`, "info");
     await bind(workspace.id, ctx);
+    return true;
   };
   const edit = async (ctx: ExtensionCommandContext, targetId?: string) => {
     const config = await store.read();
@@ -355,7 +387,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
       ctx.ui.notify(`已更新工作区 ${updated.name} (${updated.id})`, "info");
     }
   };
-  const remove = async (id: string, ctx: ExtensionCommandContext) => {
+  const remove = async (id: string, ctx: ExtensionContext) => {
     const config = await store.read();
     const target = config.workspaces.find(w => w.id === id);
     if (!target) throw new Error(`Unknown workspace: ${id}`);
@@ -364,7 +396,75 @@ export default function remoteExtension(pi: ExtensionAPI) {
     }
     await store.update(current => ({ ...current, workspaces: current.workspaces.filter(w => w.id !== id) }));
     await sessionStore.clearWorkspace(id);
+    await removeWorkspaceAnchorIfEmpty(id, config, store.file);
     ctx.ui.notify(`已删除工作区配置 ${target.name} (${target.id})`, "info");
+  };
+  const showAnchors = async (ctx: ExtensionContext) => {
+    const config = await store.read();
+    const synced = await syncWorkspaceAnchors(config, store.file);
+    const lines = [
+      "Pi Remote · pi-web 独立远程锚点目录（无需绑定本地代码项目）",
+      "",
+      "共享选服目录（打开后首次发消息或输入 / 自动弹窗选服）：",
+      synced.root,
+      "",
+      "工作区直连目录（在 pi-web 中打开对应目录即可自动绑定）：",
+      ...(config.workspaces.length
+        ? config.workspaces.map(w => `- ${w.name} [${w.id}]: ${synced.workspaces[w.id]}`)
+        : ["- （暂无工作区；可用 /remote add 或 /remote web 添加）"]),
+    ];
+    if (nativeMode) {
+      pi.sendMessage({ customType: "pi-remote-anchors", content: lines.join("\n"), display: true });
+    }
+    ctx.ui.notify(`锚点目录已同步：${synced.root}`, "info");
+  };
+  const openPickerOnStart = async (ctx: ExtensionContext, config: RemoteConfig) => {
+    if (!ctx.hasUI) {
+      state = { mode: "blocked", error: "Opened shared remote anchor without UI. Use --remote <id>, /remote use <id>, or open a workspace anchor directory." };
+      display(ctx);
+      return;
+    }
+    const workspaceItems = config.workspaces.map(w => formatWorkspaceChoice(w));
+    const actions = ["➕ 添加远程工作区", "🌐 浏览器配置与文件管理", "🔌 暂不绑定（仅本地）"];
+    const choice = await ctx.ui.select("Pi Remote · 选择本会话的 SSH 工作区", [...workspaceItems, ...actions]);
+    if (!choice) {
+      state = { mode: "blocked", error: "未选择 SSH 工作区；点击底边栏或输入 /remote 选择工作区，或 /remote local 切换到本地" };
+      display(ctx);
+      return;
+    }
+    const index = workspaceItems.indexOf(choice);
+    if (index >= 0) {
+      try { await bind(config.workspaces[index]!.id, ctx); }
+      catch (error) {
+        state = { mode: "blocked", error: (error as Error).message };
+        await persist(ctx);
+        ctx.ui.notify(state.error, "error");
+      }
+      return;
+    }
+    if (choice === "➕ 添加远程工作区") {
+      try {
+        const bound = await add(ctx);
+        if (!bound && state.mode === "local") {
+          state = { mode: "blocked", error: "未完成工作区添加；点击底边栏或输入 /remote 重试" };
+          display(ctx);
+        }
+      } catch (error) {
+        state = { mode: "blocked", error: (error as Error).message };
+        await persist(ctx);
+        ctx.ui.notify(state.error, "error");
+      }
+      return;
+    }
+    if (choice === "🌐 浏览器配置与文件管理") {
+      await openWeb(ctx);
+      state = { mode: "blocked", error: "请在管理界面创建工作区后，点击底边栏或输入 /remote 选择绑定" };
+      display(ctx);
+      return;
+    }
+    if (choice === "🔌 暂不绑定（仅本地）") {
+      await switchToLocal(ctx, true);
+    }
   };
   const ensureBoundForModal = async (ctx: ExtensionCommandContext): Promise<Binding | undefined> => {
     if (state.mode === "blocked") throw new Error(state.error);
@@ -457,6 +557,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
           }
           if (text === "web") { await openWeb(ctx); return; }
           if (text === "add") { await add(ctx); return; }
+          if (text === "anchors") { await showAnchors(ctx); return; }
           if (text === "hosts" || text === "refresh") {
             const inventory = await discoverHosts(await store.read());
             if (inventory.warnings.length) ctx.ui.notify(inventory.warnings.join("\n"), "warning");
@@ -478,16 +579,17 @@ export default function remoteExtension(pi: ExtensionAPI) {
             await runProbeNotify(ctx);
             return;
           }
-          if (text) throw new Error("Usage: /remote [use <id> | files [path] | git | add | edit [id] | remove <id> | hosts | status | test | web | local]");
+          if (text) throw new Error("Usage: /remote [use <id> | files [path] | git | add | edit [id] | remove <id> | hosts | anchors | status | test | web | local]");
           const config = await store.read();
           const activeId = state.mode === "remote" ? state.binding.workspace.id : undefined;
-          const workspaceItems = config.workspaces.map(w => `${w.id === activeId ? "● " : ""}${w.name} — ${w.host}:${w.path} [${w.id}]`);
+          const workspaceItems = config.workspaces.map(w => formatWorkspaceChoice(w, activeId));
           const filesAction = state.mode === "remote" ? "📁 浏览与编辑远程文件" : undefined;
           const gitAction = state.mode === "remote" && state.binding.probe.git ? "🌿 查看远程 Git 状态与 Diff" : undefined;
           const testAction = state.mode === "remote" ? "🩺 测试当前连接" : undefined;
           const addAction = "➕ 添加远程工作区";
           const editAction = config.workspaces.length ? "✏️ 编辑远程工作区" : undefined;
           const deleteAction = config.workspaces.length ? "🗑 删除远程工作区" : undefined;
+          const anchorsAction = nativeMode ? "📂 查看 pi-web 锚点目录" : undefined;
           const hostsAction = "🔍 刷新 SSH 主机列表";
           const webAction = "🌐 浏览器配置与文件管理";
           const localAction = state.mode !== "local" ? "🔌 切换到本地" : undefined;
@@ -499,6 +601,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
             addAction,
             editAction,
             deleteAction,
+            anchorsAction,
             hostsAction,
             webAction,
             localAction,
@@ -525,6 +628,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
           } else if (choice === addAction) await add(ctx);
           else if (choice === editAction) await edit(ctx);
           else if (choice === webAction) await openWeb(ctx);
+          else if (choice === anchorsAction) await showAnchors(ctx);
           else if (choice === hostsAction) {
             const inventory = await discoverHosts(await store.read());
             if (inventory.warnings.length) ctx.ui.notify(inventory.warnings.join("\n"), "warning");

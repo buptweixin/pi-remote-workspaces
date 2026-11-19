@@ -88,6 +88,7 @@ pi 的包清单在 `package.json` 的 `pi.extensions` 字段中，入口为 `src
 /remote edit [id]        编辑已保存的工作区配置
 /remote remove my-app    删除已保存的工作区配置
 /remote hosts            重新读取 SSH config，显示或导入主机
+/remote anchors          查看并同步 pi-web 独立远程锚点目录路径
 /remote use my-app-dev   绑定已保存的工作区
 /remote files [path]     在原生弹窗中浏览、搜索、新建与编辑远程文件
 /remote git              在原生弹窗中查看远程 Git 状态与文件 Diff
@@ -107,7 +108,10 @@ npx @agegr/pi-web@latest
 
 无需修改 `pi-web` 源码即可获得原生嵌入交互体验：
 
-- **输入框下方原生可点击状态栏按钮（`ExtensionStatusBar` `command:` 协议）**：未绑定时常驻 **`SSH: 本地`** 按钮，点击直接呼出工作区选择/新建弹窗（无需手动输入 `/remote`）；绑定后并排显示 **`● SSH <host> · <path>`**、**`远程文件`**、**`Git 状态`**、**`探测连接`**、**`切回本地`** 原生按钮，以及可按需展开的 ANSI 详情抽屉（`▲ pi-remote`）。
+- **输入框下方原生可点击状态栏按钮（`ExtensionStatusBar` `command:` 协议）**：未绑定时显示可点击的 **`SSH: 本地`** 按钮，点击直接呼出工作区选择/新建弹窗（无需手动输入 `/remote`）；绑定后并排显示 **`● SSH <host> · <path>`**、**`远程文件`**、**`Git 状态`**、**`探测连接`**、**`切回本地`** 原生按钮，以及可按需展开的 ANSI 详情抽屉（`▲ pi-remote`）。注意：由于 `pi-web` 会在发送首条消息或输入 `/` 查询命令时才惰性启动扩展运行时，完全空白、尚未触发任何交互的新建会话页面在首次交互前暂不显示扩展底边栏。
+- **不绑定本地项目即可连接远程服务器（远程锚点目录）**：插件会在 `~/.pi/remote-workspaces` 自动维护空本地锚点目录（可通过 `/remote anchors`、`pi-remote anchors` 或管理页一键复制路径）：
+  - 打开**工作区直连目录** `~/.pi/remote-workspaces/<workspace-id>` 时，新会话在启动阶段会自动绑定对应 SSH 工作区，无需先手动 `/remote use`（可在 `pi-web` 侧栏 Pin 固定该项目）。
+  - 打开**共享选服目录** `~/.pi/remote-workspaces` 时，首次发消息或输入 `/` 会自动弹出 SSH 工作区选择框。
 - **页内原生弹窗文件浏览/编辑与 Git Diff**：点击 **`远程文件`**（或 `/remote files`）即可在 `pi-web` 原生模态框中逐级浏览远端目录、执行 `find`/`grep` 搜索、新建文件，或用内置等宽代码编辑器弹窗直接修改并原子保存远端文本文件（带并发 `etag` 冲突保护）；点击 **`Git 状态`**（或 `/remote git`）可查看远端分支变更列表与单文件/全量 Diff。
 - **官方会话防休眠接入（`@agegr/pi-web/session-liveness/v1`）**：在交互操作或开启 `/remote web` 独立工作台期间自动续租会话活跃状态，避免被 10 分钟空闲回收中断。
 
@@ -163,6 +167,7 @@ node dist/cli.js serve --port 30142
 
 - `PI_CODING_AGENT_DIR`：更改 pi 配置目录，与 pi-web / PI-Desktop 保持一致。
 - `PI_REMOTE_CONFIG`：覆盖远程工作区配置文件路径。
+- `PI_REMOTE_ANCHOR_DIR`：覆盖本地 pi-web 锚点根目录（默认 `~/.pi/remote-workspaces`；若通过 `PI_REMOTE_CONFIG` 或 `PI_CODING_AGENT_DIR` 指定了自定义配置路径，默认在其同级目录 `remote-workspaces`）。
 - `PI_REMOTE_SESSIONS`：覆盖 PI-Desktop 会话绑定状态文件路径（默认与 `remote.json` 同目录下的 `remote-sessions.json`）。
 
 ```json
@@ -181,7 +186,7 @@ node dist/cli.js serve --port 30142
 }
 ```
 
-可选 `sshConfigPath` 为自定义配置文件的**绝对路径**。留空时使用系统 OpenSSH 默认规则；指定时通过 `ssh -F` 连接，因此不再加载系统配置。发现主机时遵循同样的文件选择规则；相对 `Include` 按用户 `~/.ssh` 或系统 `/etc/ssh` 解析。
+可选 `sshConfigPath` 与 `anchorRoot` 均须为**绝对路径**。`sshConfigPath` 留空时使用系统 OpenSSH 默认规则；指定时通过 `ssh -F` 连接，因此不再加载系统配置。发现主机时遵循同样的文件选择规则；相对 `Include` 按用户 `~/.ssh` 或系统 `/etc/ssh` 解析。`anchorRoot` 留空时使用默认锚点根目录。
 
 每次刷新主机列表都重新读取配置和 Include 文件，每次 SSH 操作都会重新应用 OpenSSH 的连接配置，无需重启。不列出 `Host *`、`Host *.example.com` 和否定规则；可手动输入一个具体的主机名。主机发现只扫描声明，不执行 `Match exec`；连接与显式解析操作由 OpenSSH 自己计算生效配置。条件 Include 中发现的候选别名是否能连接，以 OpenSSH 的实际规则为准。
 
@@ -189,7 +194,8 @@ node dist/cli.js serve --port 30142
 
 ```sh
 node dist/cli.js hosts          # 动态 SSH 主机列表及来源
-node dist/cli.js list           # 已保存的工作区
+node dist/cli.js list           # 已保存的工作区及锚点目录
+node dist/cli.js anchors        # 同步并输出 pi-web 锚点目录路径
 node dist/cli.js test my-app-dev
 node dist/cli.js remove my-app-dev
 node dist/cli.js --help
