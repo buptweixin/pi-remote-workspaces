@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.buptweixin.pi-remote",
   "name": "Pi Remote",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "内嵌于 PI-Desktop 输入框与右侧工作面板的 SSH 远程工作区：一键切换主机、浏览编辑文件、查看 Git 变更并激活 remote_* 工具。",
   "i18n": {
     "en": {

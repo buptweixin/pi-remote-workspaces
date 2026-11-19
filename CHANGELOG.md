@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0 - 2026-11-20
+
+- Manage clean local anchor directories (`~/.pi/remote-workspaces/<workspace-id>` and shared `~/.pi/remote-workspaces`) so `pi-web` sessions can connect to SSH workspaces without piggybacking on a local project.
+- Auto-bind saved SSH workspaces on `session_start` when opening a workspace anchor directory, and automatically open the SSH workspace picker modal on `session_start` when opening the shared anchor root (while preserving persisted session bindings and failing closed on unknown anchors or cancelled selection).
+- Add `/remote anchors`, `pi-remote anchors`, `anchorRoot` configuration, `PI_REMOTE_ANCHOR_DIR` override, and dashboard copy/settings controls for anchor directories; tighten remote global context filtering and bundle `anchors.js` in the PI-Desktop plugin build.
+
 ## 0.4.0 - 2026-11-18
 
 - Add native [pi-web](https://github.com/agegr/pi-web) status-shelf toolbar buttons (`ExtensionStatusBar` `command:` protocol) without patching `pi-web`: unbound sessions show a clickable `SSH: 本地` pill right below the chat composer, and bound sessions show `● SSH <host> · <path>`, `远程文件`, `Git 状态`, `探测连接`, and `切回本地` buttons alongside a collapsible ANSI details drawer (`▲ pi-remote`) while keeping `pi` CLI TUI unbound footers silent.
