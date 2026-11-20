@@ -9,8 +9,9 @@ import { ensureWorkspaceAnchor, matchAnchorCwd, removeWorkspaceAnchorIfEmpty, sy
 import { discoverHosts } from "./ssh-config.js";
 import { RemoteClient, RemotePool, type RemoteContextFile } from "./remote.js";
 import {
-  bashOperations, createRemoteTools, createStandaloneRemoteTools, getNativeToolFactories,
-  hasNativeToolFactories, REMOTE_DESKTOP_TOOL_NAMES, REMOTE_DESKTOP_TOOL_SCHEMAS,
+  bashOperations, createRemoteTools, createStandaloneRemoteTools, getNativeReadonlyToolFactories,
+  getNativeToolFactories, hasNativeToolFactories, LOCAL_READONLY_TOOL_NAMES,
+  REMOTE_DESKTOP_TOOL_NAMES, REMOTE_DESKTOP_TOOL_SCHEMAS,
 } from "./tools.js";
 import { startDashboard, type Dashboard } from "./server.js";
 import {
@@ -66,17 +67,24 @@ export default function remoteExtension(pi: ExtensionAPI) {
     try { return await fn(); }
     finally { activeInteractiveOps = Math.max(0, activeInteractiveOps - 1); }
   };
-  const syncDesktopTools = () => {
-    if (nativeMode) return;
+  const syncToolSet = (names: readonly string[], enabled: boolean) => {
     try {
       const current = pi.getActiveTools();
-      const remoteSet = new Set<string>(REMOTE_DESKTOP_TOOL_NAMES);
-      const withoutRemote = current.filter(name => !remoteSet.has(name));
-      const next = state.mode === "local" ? withoutRemote : [...withoutRemote, ...REMOTE_DESKTOP_TOOL_NAMES];
+      const targetSet = new Set<string>(names);
+      const withoutTargets = current.filter(name => !targetSet.has(name));
+      const next = enabled ? [...withoutTargets, ...names] : withoutTargets;
       if (next.length !== current.length || next.some((name, idx) => name !== current[idx])) {
         pi.setActiveTools(next);
       }
     } catch { /* Host may not expose tool activation outside an active session. */ }
+  };
+  const syncDesktopTools = () => {
+    if (nativeMode) return;
+    syncToolSet(REMOTE_DESKTOP_TOOL_NAMES, state.mode !== "local");
+  };
+  const syncLocalTools = () => {
+    if (!nativeMode) return;
+    syncToolSet(LOCAL_READONLY_TOOL_NAMES, state.mode === "remote");
   };
   const display = (ctx: ExtensionContext) => {
     liveness.sync(ctx);
@@ -85,6 +93,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
   const persist = async (ctx: ExtensionContext) => {
     if (nativeMode) {
       pi.appendEntry(ENTRY, state);
+      syncLocalTools();
     } else {
       await sessionStore.set(sessionIdOf(ctx), state);
       syncDesktopTools();
@@ -126,6 +135,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
         hasSavedBinding = true;
         state = parsePersistedSessionState(entry.data);
       }
+      syncLocalTools();
     } else {
       const prevHost = state.mode === "remote" ? state.binding.workspace.host : undefined;
       const saved = await sessionStore.get(sessionIdOf(ctx));
@@ -152,6 +162,20 @@ export default function remoteExtension(pi: ExtensionAPI) {
           const client = new RemoteClient(binding.workspace, await store.read(), undefined, pool);
           const tool = createRemoteTools(client, binding.probe, signal)[local.name]!;
           return tool.execute(id, params, signal, onUpdate, ctx);
+        },
+      });
+    }
+    for (const spec of getNativeReadonlyToolFactories()) {
+      const base = spec.factory(process.cwd());
+      pi.registerTool({
+        ...base,
+        name: spec.name,
+        label: spec.label,
+        description: spec.description,
+        defaultActive: false,
+        async execute(id, params, signal, onUpdate, ctx) {
+          if (state.mode === "blocked") throw new Error(unavailableMessage(state.error));
+          return spec.factory(ctx.cwd).execute(id, params, signal, onUpdate, ctx);
         },
       });
     }
@@ -298,6 +322,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
       `All read, write, edit, bash, grep, find and ls calls operate on this SSH workspace. Use remote paths or paths relative to ${probe.root}.`,
       `File tools are restricted to ${probe.root}, including symlink targets. bash and ! commands execute on the remote host with the SSH user's privileges.`,
       `grep/find use remote ripgrep (${probe.ripgrep ? "available" : "not detected; use bash if needed"}). Do not invoke local-only tools to modify this workspace.`,
+      `Read-only local tools (local_read, local_ls, local_find, local_grep) are also available to inspect files and directories on the local machine (${ctx.cwd}).`,
     ].join("\n");
   });
 

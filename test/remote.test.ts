@@ -5,8 +5,9 @@ import { join } from "node:path";
 import { runProcess } from "../src/process.js";
 import { RemoteClient } from "../src/remote.js";
 import { defaults } from "../src/config.js";
-import { createRemoteTools, remotePath } from "../src/tools.js";
-import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
+import { createRemoteTools, getNativeReadonlyToolFactories, LOCAL_READONLY_TOOL_NAMES, remotePath } from "../src/tools.js";
+import remoteExtension from "../src/extension.js";
+import type { ExtensionAPI, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { temporary, clientFor, localTransport, workspace } from "./helpers.js";
 
 test("actual remote helper reads/writes quoted paths, preserves modes and detects conflicts", async t => {
@@ -139,4 +140,107 @@ test("remote tools minimize SSH round-trips, handle symlinks/images/@~ paths, an
     return { ...res, stdout: Buffer.concat([Buffer.from("Welcome to Corp Bastion!\n"), res.stdout]) };
   });
   assert.equal((await noisyClient.probe()).root, probe.root);
+});
+
+test("nativeMode activates read-only local_* tools when bound to remote and deactivates them on /remote local", async t => {
+  const localDir = await temporary(t);
+  const remoteDir = await temporary(t);
+  await writeFile(join(localDir, "local-only.txt"), "local-secret-line\n");
+  await writeFile(join(remoteDir, "remote-only.txt"), "remote-secret-line\n");
+
+  const registeredTools = new Map<string, ToolDefinition<any, any> & { defaultActive?: boolean }>();
+  const handlers = new Map<string, Array<(event: any, ctx: any) => Promise<any> | any>>();
+  const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+  let activeTools = ["read", "write", "edit", "bash", "find", "grep", "ls"];
+
+  const pi = {
+    getSettings: () => ({}),
+    registerFlag: () => {},
+    getFlag: () => undefined,
+    registerTool: (tool: ToolDefinition<any, any> & { defaultActive?: boolean }) => {
+      registeredTools.set(tool.name, tool);
+    },
+    registerCommand: (name: string, spec: { handler: (args: string, ctx: any) => Promise<void> }) => {
+      commands.set(name, spec);
+    },
+    on: (event: string, handler: (event: any, ctx: any) => Promise<any> | any) => {
+      const list = handlers.get(event) ?? [];
+      list.push(handler);
+      handlers.set(event, list);
+    },
+    getActiveTools: () => [...activeTools],
+    setActiveTools: (names: string[]) => { activeTools = [...names]; },
+    appendEntry: () => {},
+    sendMessage: () => {},
+  } as unknown as ExtensionAPI;
+
+  remoteExtension(pi);
+
+  assert.deepEqual(
+    getNativeReadonlyToolFactories().map(spec => spec.name),
+    [...LOCAL_READONLY_TOOL_NAMES],
+  );
+  for (const name of LOCAL_READONLY_TOOL_NAMES) {
+    const tool = registeredTools.get(name);
+    assert.ok(tool, `${name} should be registered`);
+    assert.equal(tool.defaultActive, false, `${name} should default to inactive`);
+  }
+
+  let branch: Array<{ type: string; customType?: string; data?: unknown }> = [];
+  const makeCtx = () => ({
+    cwd: localDir,
+    isIdle: () => true,
+    sessionManager: { getBranch: () => branch },
+    ui: {
+      notify: () => {},
+      setStatus: () => {},
+      setWidget: () => {},
+    },
+  });
+
+  // 1. Local mode: local_* tools stay inactive.
+  for (const fn of handlers.get("session_start") ?? []) await fn({}, makeCtx());
+  for (const name of LOCAL_READONLY_TOOL_NAMES) {
+    assert.equal(activeTools.includes(name), false, `${name} should be inactive in local mode`);
+  }
+
+  // 2. Restore remote binding: local_* tools become active and operate on localDir.
+  const remoteProbe = await clientFor(remoteDir).probe();
+  branch = [{
+    type: "custom",
+    customType: "pi-remote-workspace-v1",
+    data: { mode: "remote", binding: { workspace: workspace(remoteDir), probe: remoteProbe } },
+  }];
+  for (const fn of handlers.get("session_start") ?? []) await fn({}, makeCtx());
+  for (const name of LOCAL_READONLY_TOOL_NAMES) {
+    assert.equal(activeTools.includes(name), true, `${name} should be active in remote mode`);
+  }
+
+  const promptEvent = {
+    systemPromptOptions: {
+      cwd: localDir,
+      contextFiles: [],
+      selectedTools: [...activeTools],
+      sections: {} as Record<string, string>,
+    },
+  };
+  for (const fn of handlers.get("before_agent_start") ?? []) await fn(promptEvent, makeCtx());
+  assert.match(promptEvent.systemPromptOptions.sections.ssh_workspace ?? "", /local_read, local_ls, local_find, local_grep/);
+
+  const toolCtx = { cwd: localDir } as ExtensionToolContext;
+  const localRead = await registeredTools.get("local_read")!.execute("lr", { path: "local-only.txt" }, undefined, undefined, toolCtx);
+  assert.match(JSON.stringify(localRead.content), /local-secret-line/);
+  const localLs = await registeredTools.get("local_ls")!.execute("lls", {}, undefined, undefined, toolCtx);
+  assert.match(JSON.stringify(localLs.content), /local-only\.txt/);
+  assert.doesNotMatch(JSON.stringify(localLs.content), /remote-only\.txt/);
+  const localFind = await registeredTools.get("local_find")!.execute("lf", { pattern: "*.txt" }, undefined, undefined, toolCtx);
+  assert.match(JSON.stringify(localFind.content), /local-only\.txt/);
+  const localGrep = await registeredTools.get("local_grep")!.execute("lg", { pattern: "local-secret-line", literal: true }, undefined, undefined, toolCtx);
+  assert.match(JSON.stringify(localGrep.content), /local-secret-line/);
+
+  // 3. Switch back to local: local_* tools are deactivated again.
+  await commands.get("remote")!.handler("local", makeCtx());
+  for (const name of LOCAL_READONLY_TOOL_NAMES) {
+    assert.equal(activeTools.includes(name), false, `${name} should be deactivated after /remote local`);
+  }
 });

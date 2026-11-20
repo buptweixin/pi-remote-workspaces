@@ -23,6 +23,15 @@ export const REMOTE_DESKTOP_TOOL_NAMES = [
 
 export type RemoteDesktopToolName = (typeof REMOTE_DESKTOP_TOOL_NAMES)[number];
 
+export const LOCAL_READONLY_TOOL_NAMES = [
+  "local_read",
+  "local_ls",
+  "local_find",
+  "local_grep",
+] as const;
+
+export type LocalReadonlyToolName = (typeof LOCAL_READONLY_TOOL_NAMES)[number];
+
 /**
  * Inspect ownKeys without triggering PI-Desktop's Proxy get/has diagnostics on
  * `@earendil-works/pi-coding-agent` exports outside its compatibility subset.
@@ -41,6 +50,43 @@ export function getNativeToolFactories(): Array<(cwd: string, options?: any) => 
     codingAgent.createFindToolDefinition,
     codingAgent.createGrepToolDefinition as unknown as (cwd: string, options?: any) => ToolDefinition<any, any>,
     codingAgent.createLsToolDefinition,
+  ];
+}
+
+export interface LocalReadonlyToolSpec {
+  name: LocalReadonlyToolName;
+  label: string;
+  description: string;
+  factory: (cwd: string, options?: any) => ToolDefinition<any, any>;
+}
+
+export function getNativeReadonlyToolFactories(): LocalReadonlyToolSpec[] {
+  if (!hasNativeToolFactories()) return [];
+  return [
+    {
+      name: "local_read",
+      label: "Local Read",
+      description: "Read a text or image file on the local machine (relative paths resolve against the local session working directory, not the SSH remote workspace).",
+      factory: codingAgent.createReadToolDefinition,
+    },
+    {
+      name: "local_ls",
+      label: "Local List",
+      description: "List directory contents on the local machine (relative paths resolve against the local session working directory, not the SSH remote workspace).",
+      factory: codingAgent.createLsToolDefinition,
+    },
+    {
+      name: "local_find",
+      label: "Local Find",
+      description: "Find files by glob pattern on the local machine (relative paths resolve against the local session working directory, not the SSH remote workspace).",
+      factory: codingAgent.createFindToolDefinition,
+    },
+    {
+      name: "local_grep",
+      label: "Local Grep",
+      description: "Search file contents on the local machine (relative paths resolve against the local session working directory, not the SSH remote workspace).",
+      factory: codingAgent.createGrepToolDefinition as unknown as (cwd: string, options?: any) => ToolDefinition<any, any>,
+    },
   ];
 }
 
