@@ -234,22 +234,34 @@ export async function openRemoteFileEditor(
     return { saved: false };
   }
   if (raw.length > MAX_INLINE_EDITOR_BYTES) {
-    const preview = raw.subarray(0, 32 * 1024).toString("utf8");
+    const preview = new TextDecoder("utf-8", { fatal: false }).decode(raw.subarray(0, 32 * 1024));
     await ui.editor(
       `${client.workspace.host}:${relPath}（文件较大 ${(raw.length / 1024).toFixed(1)} KiB · 只读前 32 KiB 预览）`,
       preview,
     );
     return { saved: false };
   }
-  const original = raw.toString("utf8");
-  const edited = await ui.editor(`${client.workspace.host}:${relPath}（修改后保存写入远端，取消不保存）`, original);
+  const hasBom = raw.length >= 3 && raw[0] === 0xef && raw[1] === 0xbb && raw[2] === 0xbf;
+  let body: string;
+  try {
+    body = new TextDecoder("utf-8", { fatal: true }).decode(hasBom ? raw.subarray(3) : raw);
+  } catch {
+    ui.notify(`非 UTF-8 编码文件，无法在文本编辑器中安全编辑：${relPath}`, "warning");
+    return { saved: false };
+  }
+  const crlf = body.includes("\r\n") && !body.replaceAll("\r\n", "").includes("\n");
+  const normalizedOriginal = crlf ? body.replaceAll("\r\n", "\n") : body;
+
+  const edited = await ui.editor(`${client.workspace.host}:${relPath}（修改后保存写入远端，取消不保存）`, normalizedOriginal);
   if (edited === undefined) return { saved: false };
-  if (edited === original) {
+  const normalizedEdited = edited.replaceAll("\r\n", "\n");
+  if (normalizedEdited === normalizedOriginal) {
     ui.notify(`文件未修改：${relPath}`, "info");
     return { saved: false };
   }
+  const payload = `${hasBom ? "\uFEFF" : ""}${crlf ? normalizedEdited.replaceAll("\n", "\r\n") : normalizedEdited}`;
   try {
-    await client.write(relPath, edited, file.etag);
+    await client.write(relPath, payload, file.etag);
     ui.notify(`已保存远程文件：${relPath}`, "info");
     return { saved: true };
   } catch (error) {
@@ -257,7 +269,7 @@ export async function openRemoteFileEditor(
     if (/changed remotely|conflict/i.test(message)) {
       const overwrite = await ui.confirm("远程文件冲突", `远程文件 ${relPath} 在编辑期间已被修改，是否强制覆盖保存？`);
       if (overwrite) {
-        await client.write(relPath, edited);
+        await client.write(relPath, payload);
         ui.notify(`已覆盖保存远程文件：${relPath}`, "info");
         return { saved: true };
       }
@@ -271,7 +283,7 @@ export async function openRemoteFileEditor(
 export async function browseRemoteFiles(
   client: RemoteClient,
   root: string,
-  hasRipgrep: boolean,
+  _hasRipgrep: boolean,
   ui: Pick<ExtensionUIContext, "select" | "input" | "editor" | "confirm" | "notify">,
   initialPath = ".",
 ): Promise<void> {
@@ -288,8 +300,8 @@ export async function browseRemoteFiles(
   while (true) {
     const entries = await client.list(currentDir);
     const upItem = currentDir !== "." ? "⬆ 返回上级目录 (..)" : undefined;
-    const findItem = hasRipgrep ? "🔍 按文件名搜索 (find)" : undefined;
-    const grepItem = hasRipgrep ? "🔎 按内容搜索 (grep)" : undefined;
+    const findItem = "🔍 按文件名搜索 (find)";
+    const grepItem = "🔎 按内容搜索 (grep)";
     const createItem = "➕ 在当前目录新建文件";
 
     const entryLabels = entries.map((entry: DirectoryEntry) => {
@@ -361,7 +373,7 @@ export async function browseRemoteFiles(
       if (!picked) continue;
       const match = /^(.+?):\d+:/.exec(picked);
       const filePart = match ? match[1]! : picked;
-      const targetRel = normalizeWorkspaceRelPath(filePart, root);
+      const targetRel = normalizeWorkspaceRelPath(currentDir === "." ? filePart : `${currentDir}/${filePart}`, root);
       await openRemoteFileEditor(client, targetRel, ui);
       continue;
     }

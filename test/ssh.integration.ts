@@ -105,8 +105,8 @@ test("real OpenSSH transport, actual SDK loading, session binding and isolation"
   await resumed.prompt("/remote status");
   assert.match(notices.at(-1)!, /本地/);
 
-  // Verify Keep-Alive RemotePool reuses warm SSH Python workers and rotates on config change.
-  const pool = new RemotePool();
+  // Verify Keep-Alive RemotePool reuses warm SSH Python workers, caps concurrency under burst load, and rotates on config change.
+  const pool = new RemotePool({ maxConcurrentPerKey: 2, maxIdlePerKey: 2 });
   t.after(() => pool.close());
   const pooledClient = new RemoteClient(fixture.config.workspaces[0]!, fixture.config, undefined, pool);
   await pooledClient.probe();
@@ -116,6 +116,12 @@ test("real OpenSSH transport, actual SDK loading, session binding and isolation"
     assert.equal(Buffer.from(content.data, "base64").toString(), "SSH transport works\n");
   }
   assert.equal(pool.size, 1, "consecutive RPCs should reuse the single warm SSH worker");
+
+  const burstResults = await Promise.all(
+    Array.from({ length: 8 }, () => pooledClient.read("actual-ssh.txt")),
+  );
+  assert.equal(burstResults.length, 8);
+  assert.ok(pool.size <= 2, `Expected pool size <= 2 under 8-way parallel burst, got ${pool.size}`);
 
   // Verify remote AGENTS.md replaces unrelated local AGENTS.md in system prompt and /remote completions work.
   const localDir = join(fixture.root, "local-cwd"), remoteDir = join(fixture.root, "remote-repo");

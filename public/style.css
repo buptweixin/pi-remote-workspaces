@@ -2,3 +2,4 @@
 
 .workspace-card>span:last-child{min-width:0}.workspace-card small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #host-preview:empty{display:none}.checkbox:has(input:disabled){opacity:.4;pointer-events:none}
+.file-row.escaped{opacity:.55;color:#e7bb83}.search-hit{display:flex;gap:10px;width:100%;padding:5px 8px;border:0;border-radius:5px;background:transparent;text-align:left;font:inherit;color:#c9d9cd}.search-hit:hover{background:#1d2820}.search-hit-path{color:var(--green);flex-shrink:0}.diff-add{color:#8be296;background:#1b332166;padding:0 4px}.diff-del{color:#f29b91;background:#3b1e1b66;padding:0 4px}.diff-hunk{color:#8eb8e5}.inline-actions button.active{border-color:var(--green);color:var(--green)}

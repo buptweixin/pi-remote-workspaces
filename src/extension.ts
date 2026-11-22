@@ -297,7 +297,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
         `This session is bound to the SSH remote workspace above while keeping local tools available:`,
         `- Use \`remote_read\`, \`remote_write\`, \`remote_edit\`, \`remote_bash\`, \`remote_ls\`, \`remote_find\`, and \`remote_grep\` for all operations on the remote project (${workspace.host}:${probe.root}). Pass remote paths or paths relative to ${probe.root}.`,
         `- Local built-in tools (\`Read\`, \`Write\`, \`Edit\`, \`Bash\`, \`Glob\`, \`Grep\`) still operate on the local machine (${ctx.cwd}) and remain available when local inspection or cross-machine work is needed.`,
-        `- Remote file tools enforce containment inside ${probe.root}, including symlink targets. \`remote_bash\` executes on ${workspace.host} with the SSH user's privileges. Remote ripgrep: ${probe.ripgrep ? "available" : "not detected; use remote_bash if needed"}.`,
+        `- Remote file tools enforce containment inside ${probe.root}, including symlink targets. \`remote_bash\` executes on ${workspace.host} with the SSH user's privileges. Remote ripgrep: ${probe.ripgrep ? "available" : "not installed (automatic Python/git fallback active)"}.`,
         ...files.map(file => `\n## Remote Project Context (${file.path})\n\n${file.content.trim()}`),
       ].join("\n");
       return { systemPrompt: `${basePrompt}\n\n${section}` };
@@ -321,7 +321,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
       `Current working directory: ${probe.root}`,
       `All read, write, edit, bash, grep, find and ls calls operate on this SSH workspace. Use remote paths or paths relative to ${probe.root}.`,
       `File tools are restricted to ${probe.root}, including symlink targets. bash and ! commands execute on the remote host with the SSH user's privileges.`,
-      `grep/find use remote ripgrep (${probe.ripgrep ? "available" : "not detected; use bash if needed"}). Do not invoke local-only tools to modify this workspace.`,
+      `grep/find use remote ripgrep (${probe.ripgrep ? "available" : "not installed; automatic Python/git fallback active"}). Do not invoke local-only tools to modify this workspace.`,
       `Read-only local tools (local_read, local_ls, local_find, local_grep) are also available to inspect files and directories on the local machine (${ctx.cwd}).`,
     ].join("\n");
   });

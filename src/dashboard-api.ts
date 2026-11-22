@@ -17,7 +17,7 @@ function readRuntimeVersion(): string {
       if (typeof parsed.version === "string" && parsed.version) return parsed.version;
     } catch { /* Try next candidate. */ }
   }
-  return "0.2.0";
+  return "0.5.0";
 }
 
 const packageVersion = readRuntimeVersion();
@@ -66,6 +66,7 @@ export class DashboardController {
     const workspace = config.workspaces.find(w => w.id === workspaceId);
     if (!workspace) throw new Error(`Workspace not found: ${workspaceId}`);
     const probe = await this.clientFor(workspace, config).probe(signal);
+    if (signal?.aborted) throw new Error("Operation aborted");
     const state: PersistedSessionState = {
       mode: "remote",
       binding: { workspace: { ...workspace, path: probe.root }, probe },
@@ -147,9 +148,11 @@ export class DashboardController {
           host: typeof input.host === "string" ? input.host.trim() : input.host,
           path: typeof input.path === "string" ? input.path.trim() : input.path,
         } as Workspace;
-        await this.store.update(current => ({ ...current, workspaces: current.workspaces.map(w => w.id === workspace.id ? updated : w) }));
-        if (updated.host !== workspace.host) await this.pool.closeHost(workspace.host);
-        return { status: 200, body: updated };
+        const savedConfig = await this.store.update(current => ({ ...current, workspaces: current.workspaces.map(w => w.id === workspace.id ? updated : w) }));
+        const validated = savedConfig.workspaces.find(w => w.id === workspace.id) ?? updated;
+        await this.sessionStore.syncWorkspaceUpdate(workspace, validated);
+        if (validated.host !== workspace.host) await this.pool.closeHost(workspace.host);
+        return { status: 200, body: validated };
       }
       if (method !== "POST") return { status: 405, body: { error: "Use POST for remote operations" } };
       const client = this.clientFor(workspace, config);
@@ -164,7 +167,17 @@ export class DashboardController {
           result = await client.write(requiredString(input.path, "path"), requiredString(input.content, "content"), etag, signal);
           break;
         }
-        case "search": result = await client.rpc(input.mode === "find" ? "find" : "grep", { ...input, pattern: requiredString(input.pattern, "pattern") }, signal); break;
+        case "search": {
+          const searchParams: Record<string, unknown> = { pattern: requiredString(input.pattern, "pattern") };
+          if (typeof input.path === "string" && input.path.trim()) searchParams.path = input.path.trim();
+          if (typeof input.glob === "string" && input.glob.trim()) searchParams.glob = input.glob.trim();
+          if (typeof input.ignoreCase === "boolean") searchParams.ignoreCase = input.ignoreCase;
+          if (typeof input.literal === "boolean") searchParams.literal = input.literal;
+          if (typeof input.context === "number" && Number.isFinite(input.context)) searchParams.context = input.context;
+          if (typeof input.limit === "number" && Number.isFinite(input.limit)) searchParams.limit = input.limit;
+          result = await client.rpc(input.mode === "find" ? "find" : "grep", searchParams, signal);
+          break;
+        }
         case "git": result = await client.rpc("git", { action: input.action }, signal); break;
         case "exec": {
           const chunks: Buffer[] = [];

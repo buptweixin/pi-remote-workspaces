@@ -7,13 +7,13 @@
 - 动态发现 `~/.ssh/config`、系统配置和递归 `Include` 中的明确主机别名；支持通配 Include、双引号路径和多个 Host 别名。
 - 真正的连接由系统 **OpenSSH** 完成，沿用 `ProxyJump`、`ProxyCommand`、IdentityFile、ssh-agent 和 Host/Match 规则；不复制或保存私钥、密码。
 - 多个保存的工作区，每个会话独立绑定主机和目录；绑定记录持久化并在恢复或切换模型时保留。
-- 在 **pi / pi-web** 中将 `read`、`write`、`edit`、`bash`、`grep`、`find`、`ls` 以及用户 `!` 命令路由到远程；在 **PI-Desktop** 中自动激活 `remote_read`、`remote_write`、`remote_edit`、`remote_bash`、`remote_ls`、`remote_find`、`remote_grep` 并与本地内置工具共存。
+- 在 **pi / pi-web** 中将 `read`、`write`、`edit`、`bash`、`grep`、`find`、`ls` 以及用户 `!` 命令路由到远程，同时提供只读的 `local_read`、`local_ls`、`local_find`、`local_grep` 查看本机文件；在 **PI-Desktop** 中自动激活 `remote_read`、`remote_write`、`remote_edit`、`remote_bash`、`remote_ls`、`remote_find`、`remote_grep` 并与本地内置工具共存。
 - `/remote` 配置菜单同时兼容 TUI、pi-web 和 PI-Desktop。管理工作台既可作为独立浏览器界面启动，也可在 PI-Desktop 右侧工作面板（`SSH 远程工作区`）或独立窗口内嵌运行，支持一键绑定/解绑当前聊天会话。
 - 文件写入使用临时文件和原子替换；编辑与浏览器保存检测版本冲突，保留已有文件权限。远程连接错误不会回退到本地执行。
 
 ## 环境
 
-本机：Node.js **≥ 22.19**，系统 `ssh`；远端：Linux/macOS、**Python 3.8+** 和 `bash`。搜索需要远端安装 `ripgrep`，Git 面板需要远端安装 `git`。
+本机：Node.js **≥ 22.19**，系统 `ssh`；远端：Linux/macOS、**Python 3.8+** 和 `bash`。远端推荐安装 `ripgrep` (`rg`) 以获得最快搜索性能（未安装时自动降级为 `git ls-files` / Python 搜索）；Git 面板需要远端安装 `git`。
 
 先在终端确认登录与主机指纹：
 
@@ -205,7 +205,7 @@ node dist/cli.js --help
 
 - 文件工具和管理界面文件操作限制在绑定根目录内，拒绝 `..` 和指向根目录外的符号链接。**bash 是 SSH 用户权限下的 shell，不是文件系统沙箱**。其他扩展提供的工具不会自动迁移到远端；在 SSH 模式中阻止内置 PowerShell，使用 bash。
 - 浏览器提供一次性命令执行，暂不提供 PTY、持久交互终端、语言服务、远程调试或编辑器语法高亮。
-- 单个文件最大 8 MiB；目录最多 5000 项。浏览器命令输出最大 1 MiB，搜索和 Git 输出有截断限制。浏览器仅编辑 UTF-8 文本；统一 CRLF 文件在保存时保留 CRLF。
+- 整文件读写与图片传输上限为 8 MiB；Agent 按行分段读取文本文件（`read` / `remote_read`）支持流式扫描至 128 MiB；单目录最多 5000 项。浏览器命令输出上限 1 MiB，超过 512 KiB 的大文件在内联编辑器中自动以只读模式预览。搜索和 Git 输出有截断限制。编辑器仅修改有效 UTF-8 文本，统一 CRLF 文件在保存时保留 CRLF。
 - 取消与超时会终止本机 SSH 进程组；远端命令、后台进程或自行脱离终端的进程可能继续运行。需要可靠的长任务管理时，请在远端使用 tmux 或其他进程管理器。
 - agent 的模型调用、会话存储和 skills 仍在 pi 所在机器上；绑定远程工作区后，扩展会将系统提示中的工作目录设为远程根目录，并用远程根目录内的 `AGENTS.md` / `CLAUDE.md` 替换本地项目上下文。不同机器或权限模式之间切换，建议使用独立会话。
 - 当前正式兼容目标为新版 `@earendil-works/pi-coding-agent`；尚未验证旧版 `@mariozechner/pi-coding-agent`。

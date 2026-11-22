@@ -7,13 +7,13 @@ SSH workspaces for **pi coding agent**, **pi-web**, and **[PI-Desktop](https://g
 - Discover concrete host aliases dynamically from `~/.ssh/config`, system configuration, and recursive `Include` directives. Supports glob includes, double-quoted paths, and multiple aliases per `Host` line.
 - Use your system **OpenSSH** client, including `ProxyJump`, `ProxyCommand`, `IdentityFile`, ssh-agent, and Host/Match rules. No private keys or passwords are copied or stored by this extension.
 - Save multiple workspaces and bind each session to its own host and directory. Bindings persist across session resume, model switches, and restarts.
-- Route pi's `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls` tools (plus user `!` commands) to the remote workspace in **pi / pi-web**; in **PI-Desktop**, automatically activate `remote_read`, `remote_write`, `remote_edit`, `remote_bash`, `remote_ls`, `remote_find`, and `remote_grep` alongside local built-in tools.
+- Route pi's `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls` tools (plus user `!` commands) to the remote workspace in **pi / pi-web** while exposing read-only `local_read`, `local_ls`, `local_find`, and `local_grep` tools for local inspection; in **PI-Desktop**, automatically activate `remote_read`, `remote_write`, `remote_edit`, `remote_bash`, `remote_ls`, `remote_find`, and `remote_grep` alongside local built-in tools.
 - Configure workspaces through `/remote` across TUI, pi-web, and PI-Desktop. The workbench runs both as a standalone browser dashboard and docked inside PI-Desktop's right Work Panel (`SSH Remote` / `SSH 远程工作区`) or standalone panel window with one-click session binding.
 - Write files through temporary files and atomic replacement. Editing and dashboard saves check for version conflicts and preserve existing file permissions. SSH failures never fall back to local execution.
 
 ## Requirements
 
-**Local:** Node.js **22.19 or later** and the system `ssh` client. **Remote:** Linux or macOS with **Python 3.8+** and `bash`. Remote search requires `ripgrep`; the Git panel requires `git` on the remote host.
+**Local:** Node.js **22.19 or later** and the system `ssh` client. **Remote:** Linux or macOS with **Python 3.8+** and `bash`. `ripgrep` (`rg`) is recommended for fast remote search (automatically falls back to `git ls-files` / Python search when absent); the Git panel requires `git` on the remote host.
 
 First, confirm authentication and the host fingerprint in your terminal:
 
@@ -207,7 +207,7 @@ node dist/cli.js --help
 
 - File tools and dashboard file operations stay within the bound root, rejecting traversal and symlinks that point outside it. **Bash runs with the SSH user's privileges and is not a filesystem sandbox.** Tools from other extensions are not automatically made remote. Built-in PowerShell is blocked in SSH mode; use bash.
 - The dashboard runs one-shot commands. It does not provide a PTY, persistent interactive terminal, language server, remote debugger, or editor syntax highlighting.
-- Files are limited to 8 MiB; directory listings to 5,000 entries. Dashboard command output is limited to 1 MiB. Search and Git output may be truncated. The dashboard edits UTF-8 text; files with consistent CRLF line endings retain CRLF when saved.
+- Whole-file reads, writes, and image transfers are limited to 8 MiB; agent text line-range reads (`read` / `remote_read`) stream up to 128 MiB; directory listings cap at 5,000 entries. Dashboard command output is limited to 1 MiB, and inline browser editors preview files larger than 512 KiB in read-only mode. Search and Git output may be truncated. The dashboard and modal editors edit UTF-8 text and preserve consistent CRLF line endings.
 - Cancellation and timeouts terminate the local SSH process group. Remote commands, background jobs, or detached processes may keep running. Use tmux or another remote process manager for long-running work that needs reliable lifecycle management.
 - Model calls, session storage, and skills remain on the machine running pi. When bound to a remote workspace, the extension sets the prompt working directory to the remote root and replaces local project context with remote `AGENTS.md` / `CLAUDE.md` instructions when present inside the bound root. Prefer separate sessions when switching machines or privilege levels.
 - The supported host is the current `@earendil-works/pi-coding-agent`. Older `@mariozechner/pi-coding-agent` releases have not been tested.

@@ -4,7 +4,7 @@ import { Type } from "typebox";
 import * as codingAgent from "@earendil-works/pi-coding-agent";
 import type { BashOperations, GrepToolDetails, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { ProcessAbortError, ProcessTimeoutError } from "./process.js";
-import { RemoteClient, type DirectoryEntry, type Probe, type TextOutput } from "./remote.js";
+import { RemoteClient, type DirectoryEntry, type Probe, type RemoteTextSlice, type TextOutput } from "./remote.js";
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
@@ -332,6 +332,25 @@ export const REMOTE_DESKTOP_TOOL_SCHEMAS = {
   },
 } as const;
 
+function formatRemoteSliceResult(target: string, slice: RemoteTextSlice, start: number) {
+  const totalLines = slice.totalLines ?? 0;
+  if (start > totalLines && totalLines > 0) {
+    return {
+      content: [{ type: "text" as const, text: `[Offset ${start} exceeds file length (${totalLines} lines) in ${target}]` }],
+      details: { path: target, totalLines },
+    };
+  }
+  const endLine = slice.endLine ?? start;
+  let output = slice.text ?? "";
+  if (endLine < totalLines || slice.truncatedByBytes) {
+    output += `\n\n[Showing lines ${start}-${endLine} of ${totalLines}${slice.truncatedByBytes ? " (50.0KB limit)" : ""}. Use offset=${endLine + 1} to read more.]`;
+  }
+  return {
+    content: [{ type: "text" as const, text: output }],
+    details: { path: target, startLine: start, endLine, totalLines },
+  };
+}
+
 /**
  * Self-contained remote tools for hosts like PI-Desktop where core tool names
  * (Read/Write/Edit/Bash/Glob/Grep) are reserved and SDK tool factories are shimmed.
@@ -350,7 +369,25 @@ export function createStandaloneRemoteTools(
       async execute(_id, params: { path: string; offset?: number; limit?: number }, toolSignal) {
         const activeSignal = toolSignal ?? signal;
         const target = norm(params.path);
-        const file = await client.read(target, activeSignal);
+        const start = Math.max(1, params.offset ?? 1);
+        const maxLines = Math.max(1, Math.min(5000, params.limit ?? MAX_READ_LINES));
+
+        if (params.offset !== undefined || params.limit !== undefined) {
+          const slice = await client.readLines(target, { offset: start, limit: maxLines, maxBytes: MAX_TOOL_TEXT_BYTES }, activeSignal);
+          if (!slice.image) return formatRemoteSliceResult(target, slice, start);
+        }
+
+        let file: { data: string; etag: string };
+        try {
+          file = await client.read(target, activeSignal);
+        } catch (error) {
+          if (/File exceeds 8 MiB/.test((error as Error).message)) {
+            const slice = await client.readLines(target, { offset: start, limit: maxLines, maxBytes: MAX_TOOL_TEXT_BYTES }, activeSignal);
+            return formatRemoteSliceResult(target, slice, start);
+          }
+          throw error;
+        }
+
         const buffer = Buffer.from(file.data, "base64");
         const mimeType = detectImageMimeType(buffer);
         if (mimeType) {
@@ -368,8 +405,6 @@ export function createStandaloneRemoteTools(
         const raw = buffer.toString("utf8");
         const text = raw.startsWith("\uFEFF") ? raw.slice(1) : raw;
         const lines = text.replaceAll("\r\n", "\n").split("\n");
-        const start = Math.max(1, params.offset ?? 1);
-        const maxLines = Math.max(1, Math.min(5000, params.limit ?? MAX_READ_LINES));
         if (start > lines.length && lines.length > 0) {
           return {
             content: [{ type: "text", text: `[Offset ${start} exceeds file length (${lines.length} lines) in ${target}]` }],
@@ -391,14 +426,14 @@ export function createStandaloneRemoteTools(
           bytes += lineBytes;
         }
         const endLine = start + selected.length - 1;
-        let output = selected.join("\n");
-        if (endLine < lines.length || truncatedByBytes) {
-          output += `\n\n[Showing lines ${start}-${endLine} of ${lines.length}${truncatedByBytes ? " (50.0KB limit)" : ""}. Use offset=${endLine + 1} to read more.]`;
-        }
-        return {
-          content: [{ type: "text", text: output }],
-          details: { path: target, startLine: start, endLine, totalLines: lines.length },
-        };
+        return formatRemoteSliceResult(target, {
+          image: false,
+          text: selected.join("\n"),
+          startLine: start,
+          endLine,
+          totalLines: lines.length,
+          truncatedByBytes,
+        }, start);
       },
     },
     remote_write: {
@@ -553,8 +588,9 @@ export function createRemoteTools(client: RemoteClient, probe: Pick<Probe, "root
   return {
     read: {
       ...baseRead,
-      execute(id, params, toolSignal, update, ctx) {
+      async execute(id, params, toolSignal, update, ctx) {
         const activeSignal = toolSignal ?? signal;
+        const normalized = normalizeArgs(params) as { path?: string; offset?: number; limit?: number };
         let cached: { path: string; buffer: Buffer } | undefined;
         const load = async (path: string) => {
           if (cached?.path === path) return cached.buffer;
@@ -574,7 +610,17 @@ export function createRemoteTools(client: RemoteClient, probe: Pick<Probe, "root
             },
           },
         }) as ToolDefinition<any, any>;
-        return impl.execute(id, normalizeArgs(params), activeSignal, update, { ...ctx, cwd: root });
+        try {
+          return await impl.execute(id, normalized, activeSignal, update, { ...ctx, cwd: root });
+        } catch (error) {
+          if (typeof normalized?.path === "string" && /File exceeds 8 MiB/.test((error as Error).message)) {
+            const start = Math.max(1, normalized.offset ?? 1);
+            const maxLines = Math.max(1, Math.min(5000, normalized.limit ?? MAX_READ_LINES));
+            const slice = await client.readLines(normalized.path, { offset: start, limit: maxLines, maxBytes: MAX_TOOL_TEXT_BYTES }, activeSignal);
+            return formatRemoteSliceResult(normalized.path, slice, start);
+          }
+          throw error;
+        }
       },
     },
     write: {

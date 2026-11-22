@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { DashboardController, type ControllerOptions } from "./dashboard-api.js";
-import { discoverHosts, type HostInventory } from "./ssh-config.js";
+import { discoverHosts, sshConfigSignature, type HostInventory } from "./ssh-config.js";
 import { RemoteClient, type Probe } from "./remote.js";
 import type { PersistedSessionState, RemoteConfig } from "./config.js";
 
@@ -41,10 +41,15 @@ export interface AsyncRemoteJob {
   updatedAt: number;
 }
 
+const ACTIVE_TURN_MESSAGE = "请等待当前对话回合结束后再切换远程工作区";
+
 export function createPiDesktopPlugin(options?: ControllerOptions) {
   let controller: DashboardController | undefined;
-  let hostCache: { at: number; inventory: HostInventory } | undefined;
+  let hostCache: { at: number; configKey: string; signature: string; files: string[]; inventory: HostInventory } | undefined;
   const jobs = new Map<string, AsyncRemoteJob>();
+  const inflightPanelRequests = new Map<string, AbortController>();
+  const sessionBindControllers = new Map<string, AbortController>();
+  const sessionBindSeq = new Map<string, number>();
 
   const ensureController = (): DashboardController => {
     controller ??= new DashboardController(options);
@@ -59,14 +64,37 @@ export function createPiDesktopPlugin(options?: ControllerOptions) {
 
   const getCachedInventory = async (config: RemoteConfig, force = false): Promise<HostInventory> => {
     const now = Date.now();
-    if (!force && hostCache && now - hostCache.at < 3000) return hostCache.inventory;
+    const configKey = config.sshConfigPath ?? "";
+    if (!force && hostCache && hostCache.configKey === configKey) {
+      if (now - hostCache.at < 2000) return hostCache.inventory;
+      const check = await sshConfigSignature(config, hostCache.files);
+      if (check.signature === hostCache.signature) {
+        hostCache.at = now;
+        return hostCache.inventory;
+      }
+    }
     const inventory = await discoverHosts(config);
-    hostCache = { at: now, inventory };
+    const sig = await sshConfigSignature(config, inventory.files);
+    hostCache = { at: now, configKey, signature: sig.signature, files: sig.files, inventory };
     return inventory;
+  };
+
+  const cancelPendingBindForSession = (sessionId: string): number => {
+    const nextSeq = (sessionBindSeq.get(sessionId) ?? 0) + 1;
+    sessionBindSeq.set(sessionId, nextSeq);
+    const prev = sessionBindControllers.get(sessionId);
+    if (prev) {
+      prev.abort();
+      sessionBindControllers.delete(sessionId);
+    }
+    return nextSeq;
   };
 
   const startBindJob = (sessionId: string, workspaceId: string): AsyncRemoteJob => {
     const activeController = ensureController();
+    const seq = cancelPendingBindForSession(sessionId);
+    const abortController = new AbortController();
+    sessionBindControllers.set(sessionId, abortController);
     const job: AsyncRemoteJob = {
       id: randomUUID(),
       kind: "bind",
@@ -78,8 +106,10 @@ export function createPiDesktopPlugin(options?: ControllerOptions) {
     jobs.set(job.id, job);
     pruneJobs();
 
-    void activeController.bindSession(sessionId, workspaceId).then(
+    void activeController.bindSession(sessionId, workspaceId, abortController.signal).then(
       result => {
+        if (sessionBindControllers.get(sessionId) === abortController) sessionBindControllers.delete(sessionId);
+        if (sessionBindSeq.get(sessionId) !== seq) return;
         job.status = "ready";
         job.probe = result.probe;
         job.state = result.state;
@@ -87,8 +117,9 @@ export function createPiDesktopPlugin(options?: ControllerOptions) {
         void pi.ui.showToast(`已绑定 SSH 工作区：${result.probe.hostname}:${result.probe.root}`).catch(() => {});
       },
       error => {
+        if (sessionBindControllers.get(sessionId) === abortController) sessionBindControllers.delete(sessionId);
         job.status = "error";
-        job.error = (error as Error).message;
+        job.error = abortController.signal.aborted ? "绑定请求已被更新的操作替代" : (error as Error).message;
         job.updatedAt = Date.now();
       },
     );
@@ -165,6 +196,11 @@ export function createPiDesktopPlugin(options?: ControllerOptions) {
             await pi.ui.showToast("当前没有活动的聊天会话");
             return;
           }
+          if (active.activeTurn) {
+            await pi.ui.showToast(ACTIVE_TURN_MESSAGE);
+            return;
+          }
+          cancelPendingBindForSession(active.sessionId);
           await ensureController().unbindSession(active.sessionId);
           await pi.ui.showToast("已取消当前会话的 SSH 远程工作区绑定");
         },
@@ -174,6 +210,11 @@ export function createPiDesktopPlugin(options?: ControllerOptions) {
     async onUnload(): Promise<void> {
       const running = controller;
       controller = undefined;
+      for (const reqAbort of inflightPanelRequests.values()) reqAbort.abort();
+      inflightPanelRequests.clear();
+      for (const bindAbort of sessionBindControllers.values()) bindAbort.abort();
+      sessionBindControllers.clear();
+      sessionBindSeq.clear();
       jobs.clear();
       hostCache = undefined;
       await Promise.allSettled([
@@ -218,6 +259,7 @@ export function createPiDesktopPlugin(options?: ControllerOptions) {
             const sessionId = typeof args.sessionId === "string" && args.sessionId ? args.sessionId : (active?.sessionId ?? "");
             const workspaceId = typeof args.workspaceId === "string" ? args.workspaceId.trim() : "";
             if (!sessionId) return { ok: false, error: "请先选择或新建一个聊天会话" };
+            if (active?.sessionId === sessionId && active.activeTurn) return { ok: false, error: ACTIVE_TURN_MESSAGE };
             if (!workspaceId) return { ok: false, error: "请选择一个远程工作区" };
             const job = startBindJob(sessionId, workspaceId);
             return { ok: true, job };
@@ -226,6 +268,8 @@ export function createPiDesktopPlugin(options?: ControllerOptions) {
             const active = await pi.session.getActive().catch(() => null);
             const sessionId = typeof args.sessionId === "string" && args.sessionId ? args.sessionId : (active?.sessionId ?? "");
             if (!sessionId) return { ok: false, error: "当前没有活动的聊天会话" };
+            if (active?.sessionId === sessionId && active.activeTurn) return { ok: false, error: ACTIVE_TURN_MESSAGE };
+            cancelPendingBindForSession(sessionId);
             const result = await activeController.unbindSession(sessionId);
             void pi.ui.showToast("已切回本地模式").catch(() => {});
             return { ok: true, state: result.state };
@@ -241,6 +285,20 @@ export function createPiDesktopPlugin(options?: ControllerOptions) {
           }
           case "remote.saveWorkspace": {
             const editingId = typeof args.editingId === "string" ? args.editingId.trim() : "";
+            const active = await pi.session.getActive().catch(() => null);
+            let shouldRebindEdited = false;
+            if (editingId && active?.sessionId && !active.activeTurn) {
+              const [prevCfg, prevBind] = await Promise.all([
+                activeController.store.read().catch(() => undefined),
+                activeController.getSessionBinding(active.sessionId),
+              ]);
+              const prevWs = prevCfg?.workspaces.find(w => w.id === editingId);
+              if (prevBind.state.mode === "remote" && prevBind.state.binding.workspace.id === editingId && prevWs) {
+                const nextHost = typeof args.host === "string" ? args.host.trim() : prevWs.host;
+                const nextPath = typeof args.path === "string" ? args.path.trim() : prevWs.path;
+                shouldRebindEdited = nextHost !== prevWs.host || nextPath !== prevWs.path;
+              }
+            }
             const outcome = await activeController.dispatch(
               editingId ? `/api/workspaces/${encodeURIComponent(editingId)}` : "/api/workspaces",
               editingId ? "PUT" : "POST",
@@ -259,9 +317,8 @@ export function createPiDesktopPlugin(options?: ControllerOptions) {
             }
             const workspace = outcome.body as { id: string };
             let job: AsyncRemoteJob | null = null;
-            if (args.bindNow === true) {
-              const active = await pi.session.getActive().catch(() => null);
-              if (active?.sessionId) job = startBindJob(active.sessionId, workspace.id);
+            if ((args.bindNow === true || shouldRebindEdited) && active?.sessionId && !active.activeTurn) {
+              job = startBindJob(active.sessionId, workspace.id);
             }
             return { ok: true, workspace, job };
           }
@@ -269,7 +326,12 @@ export function createPiDesktopPlugin(options?: ControllerOptions) {
             const id = typeof args.workspaceId === "string" ? args.workspaceId.trim() : "";
             if (!id) return { ok: false, error: "缺少工作区 ID" };
             const outcome = await activeController.dispatch(`/api/workspaces/${encodeURIComponent(id)}`, "DELETE", {});
-            if (outcome.status >= 400) return { ok: false, error: "删除工作区失败" };
+            if (outcome.status >= 400) {
+              const errMsg = outcome.body && typeof outcome.body === "object" && "error" in outcome.body
+                ? String((outcome.body as { error?: unknown }).error ?? "删除工作区失败")
+                : "删除工作区失败";
+              return { ok: false, error: errMsg };
+            }
             return { ok: true };
           }
           case "remote.openView": {
@@ -291,14 +353,31 @@ export function createPiDesktopPlugin(options?: ControllerOptions) {
           const path = typeof payload.path === "string" ? payload.path : "/";
           const method = typeof payload.method === "string" ? payload.method : "GET";
           const data = payload.data && typeof payload.data === "object" ? (payload.data as Record<string, unknown>) : {};
-          const outcome = await activeController.dispatch(path, method, data);
-          if (outcome.status >= 400) {
-            const errMsg = outcome.body && typeof outcome.body === "object" && "error" in outcome.body
-              ? String((outcome.body as { error?: unknown }).error ?? `Request failed (${outcome.status})`)
-              : `Request failed (${outcome.status})`;
-            throw new Error(errMsg);
+          const requestId = typeof payload.requestId === "string" && payload.requestId ? payload.requestId : "";
+          const reqAbort = requestId ? new AbortController() : undefined;
+          if (requestId && reqAbort) inflightPanelRequests.set(requestId, reqAbort);
+          try {
+            const outcome = await activeController.dispatch(path, method, data, reqAbort?.signal);
+            if (outcome.status >= 400) {
+              const errMsg = outcome.body && typeof outcome.body === "object" && "error" in outcome.body
+                ? String((outcome.body as { error?: unknown }).error ?? `Request failed (${outcome.status})`)
+                : `Request failed (${outcome.status})`;
+              throw new Error(errMsg);
+            }
+            return outcome.body;
+          } finally {
+            if (requestId && inflightPanelRequests.get(requestId) === reqAbort) {
+              inflightPanelRequests.delete(requestId);
+            }
           }
-          return outcome.body;
+        }
+        case "pi-remote.cancel": {
+          const requestId = typeof payload.requestId === "string" ? payload.requestId : "";
+          if (requestId) {
+            inflightPanelRequests.get(requestId)?.abort();
+            inflightPanelRequests.delete(requestId);
+          }
+          return { ok: true };
         }
         case "pi-remote.sessionStatus": {
           const active = await pi.session.getActive().catch(() => null);
@@ -309,12 +388,24 @@ export function createPiDesktopPlugin(options?: ControllerOptions) {
         case "pi-remote.bindSession": {
           const active = await pi.session.getActive().catch(() => null);
           const sessionId = typeof payload.sessionId === "string" && payload.sessionId ? payload.sessionId : (active?.sessionId ?? "");
+          if (active?.sessionId === sessionId && active?.activeTurn) throw new Error(ACTIVE_TURN_MESSAGE);
           const workspaceId = typeof payload.workspaceId === "string" ? payload.workspaceId.trim() : "";
-          return activeController.bindSession(sessionId, workspaceId);
+          const seq = cancelPendingBindForSession(sessionId);
+          const abortController = new AbortController();
+          sessionBindControllers.set(sessionId, abortController);
+          try {
+            const res = await activeController.bindSession(sessionId, workspaceId, abortController.signal);
+            if (sessionBindSeq.get(sessionId) !== seq) throw new Error("绑定请求已被更新的操作替代");
+            return res;
+          } finally {
+            if (sessionBindControllers.get(sessionId) === abortController) sessionBindControllers.delete(sessionId);
+          }
         }
         case "pi-remote.unbindSession": {
           const active = await pi.session.getActive().catch(() => null);
           const sessionId = typeof payload.sessionId === "string" && payload.sessionId ? payload.sessionId : (active?.sessionId ?? "");
+          if (active?.sessionId === sessionId && active?.activeTurn) throw new Error(ACTIVE_TURN_MESSAGE);
+          if (sessionId) cancelPendingBindForSession(sessionId);
           return activeController.unbindSession(sessionId);
         }
         case "pi-remote.copyText": {

@@ -270,4 +270,26 @@ export class SessionBindingStore {
       await release();
     }
   }
+
+  async syncWorkspaceUpdate(previous: Workspace, updated: Workspace): Promise<void> {
+    if (previous.host !== updated.host || previous.path !== updated.path) {
+      await this.clearWorkspace(updated.id);
+      return;
+    }
+    if (previous.name === updated.name) return;
+    const release = await acquireFileLock(this.file);
+    try {
+      const current = await this.readAll();
+      let changed = false;
+      for (const entry of Object.values(current.sessions)) {
+        if (entry.state.mode === "remote" && entry.state.binding.workspace.id === updated.id) {
+          entry.state.binding.workspace.name = updated.name;
+          changed = true;
+        }
+      }
+      if (changed) await atomicWriteJson(this.file, current);
+    } finally {
+      await release();
+    }
+  }
 }

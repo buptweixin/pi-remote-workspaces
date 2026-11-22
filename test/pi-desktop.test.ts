@@ -118,7 +118,7 @@ test("PI-Desktop plugin main entry bridges workbench API and live session bindin
   const toasts: string[] = [];
   let copied = "";
   let revealedView = "";
-  let activeSession: { sessionId: string; projectPath?: string } | null = { sessionId: "desktop-session-1", projectPath: dir };
+  let activeSession: { sessionId: string; projectPath?: string; activeTurn?: { turnId: string; startedAt: string } | null } | null = { sessionId: "desktop-session-1", projectPath: dir };
 
   (globalThis as Record<string, unknown>).pi = {
     commands: {
@@ -203,6 +203,38 @@ test("PI-Desktop plugin main entry bridges workbench API and live session bindin
   revealedView = "";
   await plugin.onRendererCall("remote.openView", {});
   assert.equal(revealedView, "workbench");
+
+  // Active turn guard blocks mid-turn workspace bind/unbind mutations.
+  activeSession = { sessionId: "desktop-session-1", projectPath: dir, activeTurn: { turnId: "t-1", startedAt: new Date().toISOString() } };
+  const blockedUnbind = await plugin.onRendererCall("remote.unbind", {}) as { ok: boolean; error?: string };
+  assert.equal(blockedUnbind.ok, false);
+  assert.match(blockedUnbind.error ?? "", /等待当前对话回合结束/);
+  await assert.rejects(plugin.onPanelInvoke("pi-remote.unbindSession", {}), /等待当前对话回合结束/);
+  activeSession = { sessionId: "desktop-session-1", projectPath: dir, activeTurn: null };
+
+  // Editing only workspace name updates persisted session binding in-place without dropping binding.
+  const renamed = await plugin.onRendererCall("remote.saveWorkspace", {
+    editingId: savedFromComposer.workspace.id,
+    host: "fixture",
+    path: remoteRoot,
+    name: "Renamed Composer Workspace",
+  }) as { ok: boolean; job: null | { id: string } };
+  assert.equal(renamed.ok, true);
+  assert.equal(renamed.job, null);
+  const afterRename = await plugin.onRendererCall("remote.state", {}) as { state: { mode: string; binding?: { workspace: { name: string } } } };
+  assert.equal(afterRename.state.binding?.workspace.name, "Renamed Composer Workspace");
+
+  // Panel request cancellation (`pi-remote.cancel`) terminates in-flight SSH exec immediately.
+  const startExecMs = Date.now();
+  const pendingExec = plugin.onPanelInvoke("pi-remote.api", {
+    requestId: "cancel-me-1",
+    path: `/api/workspaces/${savedFromComposer.workspace.id}/exec`,
+    method: "POST",
+    data: { command: "sleep 10" },
+  });
+  setTimeout(() => { void plugin.onPanelInvoke("pi-remote.cancel", { requestId: "cancel-me-1" }); }, 60);
+  await assert.rejects(pendingExec, /aborted/i);
+  assert.ok(Date.now() - startExecMs < 4000, "Cancelled panel exec must terminate promptly");
 
   await plugin.onRendererCall("remote.unbind", {});
   const afterUnbind = await plugin.onRendererCall("remote.state", {}) as { state: { mode: string } };

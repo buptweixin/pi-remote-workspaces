@@ -1,13 +1,33 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { deflateSync } from "node:zlib";
 import { validateHost, type RemoteConfig, type Workspace } from "./config.js";
 import { killProcessGroup, ProcessAbortError, ProcessTimeoutError, runProcess, shellQuote, sshChildEnv, type RunOptions, type RunResult } from "./process.js";
 import { sshArgs, sshConfigSignature } from "./ssh-config.js";
 import { REMOTE_JSON_SENTINEL, remoteScript } from "./remote-script.js";
 
+const COMPRESSED_REMOTE_SCRIPT = deflateSync(Buffer.from(remoteScript, "utf8")).toString("base64");
+
+/**
+ * Single-line ASCII bootstrap free of newlines, backslashes, `$`, or nested double quotes so
+ * non-POSIX remote login shells (`fish`, `csh`, `tcsh`, `zsh`, `sh`) invoke Python identically.
+ */
+export function remotePythonCommand(loop: boolean): string {
+  const bootstrap = `import base64,zlib;exec(compile(zlib.decompress(base64.b64decode('${COMPRESSED_REMOTE_SCRIPT}')),'<pi-remote>','exec'))`;
+  return loop ? `python3 -u -c "${bootstrap}" --loop` : `python3 -c "${bootstrap}"`;
+}
+
 export interface Probe { root: string; home: string; hostname: string; python: string; git: boolean; ripgrep: boolean }
 export interface RemoteContextFile { path: string; content: string }
 export interface DirectoryEntry { name: string; directory: boolean; symlink: boolean; escaped?: boolean }
 export interface RemoteFile { data: string; etag: string }
+export interface RemoteTextSlice {
+  image: boolean;
+  text?: string;
+  startLine?: number;
+  endLine?: number;
+  totalLines?: number;
+  truncatedByBytes?: boolean;
+}
 export interface TextOutput {
   text: string;
   exitCode: number;
@@ -181,25 +201,119 @@ class PooledWorker {
   }
 }
 
+const activePools = new Set<RemotePool>();
+let exitHooksInstalled = false;
+const cleanupAllPoolsOnExit = () => {
+  for (const pool of activePools) pool.terminateAllSync();
+};
+function trackPool(pool: RemotePool) {
+  activePools.add(pool);
+  if (!exitHooksInstalled) {
+    exitHooksInstalled = true;
+    process.on("beforeExit", cleanupAllPoolsOnExit);
+    process.on("exit", cleanupAllPoolsOnExit);
+  }
+}
+function untrackPool(pool: RemotePool) {
+  activePools.delete(pool);
+  if (activePools.size === 0 && exitHooksInstalled) {
+    exitHooksInstalled = false;
+    process.off("beforeExit", cleanupAllPoolsOnExit);
+    process.off("exit", cleanupAllPoolsOnExit);
+  }
+}
+
 /** Session-scoped pool of warm SSH Python RPC processes; never shared through module globals. */
 export class RemotePool {
   private readonly workers = new Set<PooledWorker>();
+  private readonly waitersByKey = new Map<string, Array<() => void>>();
   private readonly trackedConfigs = new Map<string, { signature: string; files: string[] }>();
   private nextRequestId = 0;
   private closed = false;
   private readonly idleTimeoutMs: number;
   private readonly maxIdlePerKey: number;
-  private readonly onProcessExit = () => { for (const worker of this.workers) worker.terminate(); };
+  private readonly maxConcurrentPerKey: number;
 
-  constructor(options: { idleTimeoutMs?: number; maxIdlePerKey?: number } = {}) {
+  constructor(options: { idleTimeoutMs?: number; maxIdlePerKey?: number; maxConcurrentPerKey?: number } = {}) {
     this.idleTimeoutMs = options.idleTimeoutMs ?? 30_000;
-    this.maxIdlePerKey = options.maxIdlePerKey ?? 2;
-    process.once("beforeExit", this.onProcessExit);
-    process.once("exit", this.onProcessExit);
+    this.maxConcurrentPerKey = Math.max(1, options.maxConcurrentPerKey ?? 4);
+    this.maxIdlePerKey = Math.min(options.maxIdlePerKey ?? 2, this.maxConcurrentPerKey);
+    trackPool(this);
+  }
+
+  terminateAllSync() {
+    for (const worker of this.workers) worker.terminate();
   }
 
   get size(): number {
     return this.workers.size;
+  }
+
+  private notifyWaiters(key?: string) {
+    if (key !== undefined) {
+      const queue = this.waitersByKey.get(key);
+      const next = queue?.shift();
+      if (queue && queue.length === 0) this.waitersByKey.delete(key);
+      next?.();
+      return;
+    }
+    for (const [k, queue] of [...this.waitersByKey.entries()]) {
+      this.waitersByKey.delete(k);
+      for (const wake of queue) wake();
+    }
+  }
+
+  private countActiveForKey(key: string): number {
+    let count = 0;
+    for (const candidate of this.workers) {
+      if (!candidate.dead && candidate.key === key) count++;
+    }
+    return count;
+  }
+
+  private waitForSlot(key: string, deadlineMs: number, signal?: AbortSignal): Promise<void> {
+    if (this.closed) return Promise.reject(new Error("Remote connection pool is closed"));
+    if (signal?.aborted) return Promise.reject(new ProcessAbortError(signal.reason));
+    const remainingMs = deadlineMs - Date.now();
+    if (remainingMs <= 0) return Promise.reject(new ProcessTimeoutError(0));
+
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const queue = this.waitersByKey.get(key) ?? [];
+      if (!this.waitersByKey.has(key)) this.waitersByKey.set(key, queue);
+
+      const removeFromQueue = () => {
+        const idx = queue.indexOf(wake);
+        if (idx >= 0) queue.splice(idx, 1);
+        if (queue.length === 0 && this.waitersByKey.get(key) === queue) this.waitersByKey.delete(key);
+      };
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        removeFromQueue();
+        cleanup();
+        reject(new ProcessAbortError(signal?.reason));
+      };
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        removeFromQueue();
+        cleanup();
+        reject(new ProcessTimeoutError(remainingMs));
+      }, remainingMs);
+      const wake = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      queue.push(wake);
+    });
   }
 
   private async computeKey(host: string, config: RemoteConfig): Promise<string> {
@@ -218,6 +332,12 @@ export class RemotePool {
     if (this.closed || worker.dead) {
       worker.terminate();
       this.workers.delete(worker);
+      this.notifyWaiters(worker.key);
+      return;
+    }
+    // If a queued request is already waiting for this key, wake it before parking idle.
+    if ((this.waitersByKey.get(worker.key)?.length ?? 0) > 0) {
+      this.notifyWaiters(worker.key);
       return;
     }
     let idleCount = 0;
@@ -227,12 +347,14 @@ export class RemotePool {
     if (idleCount > this.maxIdlePerKey) {
       worker.terminate();
       this.workers.delete(worker);
+      this.notifyWaiters(worker.key);
       return;
     }
     worker.unref();
     worker.idleTimer = setTimeout(() => {
       worker.terminate();
       this.workers.delete(worker);
+      this.notifyWaiters(worker.key);
     }, this.idleTimeoutMs);
     worker.idleTimer.unref();
   }
@@ -246,46 +368,76 @@ export class RemotePool {
       if (!stale.busy && stale.host === workspace.host && stale.key !== key) {
         stale.terminate();
         this.workers.delete(stale);
+        this.notifyWaiters(stale.key);
       }
     }
     const timeoutMs = config.commandTimeoutSeconds * 1000;
+    const deadlineMs = Date.now() + timeoutMs;
     const executeOnce = async (allowReuse: boolean): Promise<{ value: T; reused: boolean }> => {
       let worker: PooledWorker | undefined;
       let reused = false;
-      if (allowReuse) {
-        for (const candidate of this.workers) {
-          if (!candidate.busy && !candidate.dead && candidate.key === key) {
-            worker = candidate;
-            reused = true;
-            break;
+      while (!worker) {
+        if (this.closed) throw new Error("Remote connection pool is closed");
+        if (signal?.aborted) throw new ProcessAbortError(signal.reason);
+        if (allowReuse) {
+          for (const candidate of this.workers) {
+            if (!candidate.busy && !candidate.dead && candidate.key === key) {
+              worker = candidate;
+              reused = true;
+              break;
+            }
           }
         }
+        if (worker) break;
+        if (!allowReuse && this.countActiveForKey(key) >= this.maxConcurrentPerKey) {
+          for (const candidate of this.workers) {
+            if (!candidate.busy && !candidate.dead && candidate.key === key) {
+              candidate.terminate();
+              this.workers.delete(candidate);
+              break;
+            }
+          }
+        }
+        if (this.countActiveForKey(key) < this.maxConcurrentPerKey) break;
+        await this.waitForSlot(key, deadlineMs, signal);
       }
+
+      const stepTimeoutMs = () => {
+        const left = deadlineMs - Date.now();
+        if (left <= 0) throw new ProcessTimeoutError(timeoutMs);
+        return left;
+      };
+
       if (worker) {
         if (worker.idleTimer) { clearTimeout(worker.idleTimer); worker.idleTimer = undefined; }
         worker.busy = true;
         worker.ref();
       } else {
-        const args = [...sshArgs(config), "--", workspace.host, `python3 -u -c ${shellQuote(remoteScript)} --loop`];
+        const args = [...sshArgs(config), "--", workspace.host, remotePythonCommand(true)];
         worker = new PooledWorker(workspace.host, key, args);
         this.workers.add(worker);
-        void worker.closed.then(() => this.workers.delete(worker!));
+        void worker.closed.then(() => {
+          this.workers.delete(worker!);
+          this.notifyWaiters(key);
+        });
         try {
-          const handshake = await worker.nextMessage<{ ready?: boolean }>(timeoutMs, signal);
+          const handshake = await worker.nextMessage<{ ready?: boolean }>(stepTimeoutMs(), signal);
           if (!handshake?.ready) throw new Error("Invalid remote worker handshake");
         } catch (error) {
           worker.terminate();
           this.workers.delete(worker);
+          this.notifyWaiters(key);
           throw error;
         }
       }
       const id = ++this.nextRequestId;
       try {
         worker.send({ ...params, root: workspace.path, timeout: config.commandTimeoutSeconds, op, id });
-        const response = await worker.nextMessage<{ id?: number; ok: boolean; value: T; error?: string }>(timeoutMs, signal);
+        const response = await worker.nextMessage<{ id?: number; ok: boolean; value: T; error?: string }>(stepTimeoutMs(), signal);
         if (response.id !== id) {
           worker.terminate();
           this.workers.delete(worker);
+          this.notifyWaiters(key);
           throw new Error("Mismatched remote RPC response");
         }
         this.release(worker);
@@ -295,8 +447,10 @@ export class RemotePool {
         if (worker.busy) {
           worker.terminate();
           this.workers.delete(worker);
+          this.notifyWaiters(key);
         } else if (worker.dead) {
           this.workers.delete(worker);
+          this.notifyWaiters(key);
         }
         throw Object.assign(error as Error, { _reusedWorkerDead: reused && worker.dead });
       }
@@ -317,16 +471,18 @@ export class RemotePool {
       if (!host || worker.host === host) {
         worker.terminate();
         this.workers.delete(worker);
+        this.notifyWaiters(worker.key);
         closing.push(worker.closed);
       }
     }
+    if (!host) this.notifyWaiters();
     await Promise.allSettled(closing);
   }
 
   async close(): Promise<void> {
     this.closed = true;
-    process.off("beforeExit", this.onProcessExit);
-    process.off("exit", this.onProcessExit);
+    untrackPool(this);
+    this.notifyWaiters();
     await this.closeHost();
   }
 }
@@ -344,7 +500,7 @@ export class RemoteClient {
     if (this.pool && this.runner === runProcess) {
       return this.pool.rpc<T>(this.workspace, this.config, op, params, signal);
     }
-    const result = await this.runner("ssh", [...sshArgs(this.config), "--", this.workspace.host, `python3 -c ${shellQuote(remoteScript)}`], {
+    const result = await this.runner("ssh", [...sshArgs(this.config), "--", this.workspace.host, remotePythonCommand(false)], {
       input: JSON.stringify({ ...params, root: this.workspace.path, timeout: this.config.commandTimeoutSeconds, op }), signal,
       timeoutMs: this.config.commandTimeoutSeconds * 1000,
     });
@@ -359,6 +515,9 @@ export class RemoteClient {
   context(signal?: AbortSignal) { return this.rpc<RemoteContextFile[]>("context", {}, signal); }
   list(path = ".", signal?: AbortSignal) { return this.rpc<DirectoryEntry[]>("list", { path }, signal); }
   read(path: string, signal?: AbortSignal) { return this.rpc<RemoteFile>("read", { path }, signal); }
+  readLines(path: string, options: { offset?: number; limit?: number; maxBytes?: number } = {}, signal?: AbortSignal) {
+    return this.rpc<RemoteTextSlice>("read_lines", { path, ...options }, signal);
+  }
   write(path: string, content: Buffer | string, etag?: string | null, signal?: AbortSignal) {
     return this.rpc<{ etag: string }>("write", { path, data: Buffer.from(content).toString("base64"), ...(etag !== undefined ? { etag } : {}) }, signal);
   }

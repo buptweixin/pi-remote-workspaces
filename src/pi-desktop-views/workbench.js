@@ -15,7 +15,9 @@ let resolveTimer = null;
 let resolveController = null;
 let toastTimer = null;
 let readSeq = 0;
+let nextReqId = 0;
 let lastBoundWorkspaceId = "";
+const MAX_INLINE_EDITOR_BYTES = 512 * 1024;
 
 function invoke(channel, payload = {}) {
   if (!bridge?.invoke) throw new Error("请在 PI-Desktop 工作面板中打开此视图");
@@ -24,10 +26,14 @@ function invoke(channel, payload = {}) {
 
 async function api(path, method = "GET", data, signal) {
   if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+  const requestId = signal ? `wb-${++nextReqId}-${Date.now()}` : undefined;
   return new Promise((resolve, reject) => {
-    const onAbort = () => reject(new DOMException("Aborted", "AbortError"));
+    const onAbort = () => {
+      if (requestId) void invoke("pi-remote.cancel", { requestId }).catch(() => {});
+      reject(new DOMException("Aborted", "AbortError"));
+    };
     signal?.addEventListener("abort", onAbort, { once: true });
-    invoke("pi-remote.api", { path, method, data }).then(
+    invoke("pi-remote.api", { path, method, data, ...(requestId ? { requestId } : {}) }).then(
       (res) => {
         signal?.removeEventListener("abort", onAbort);
         resolve(res);
@@ -52,7 +58,9 @@ function initAppearanceSync() {
   const pull = () => invoke("app.getAppearance").then(applyAppearance).catch(() => applyAppearance(null));
   void pull();
   bridge?.on?.("appearance:changed", applyAppearance);
-  window.setInterval(pull, 2500);
+  window.setInterval(() => {
+    if (document.visibilityState !== "hidden") void pull();
+  }, 10000);
 }
 
 function toast(msg, isError = false) {
@@ -88,6 +96,7 @@ function clearEditor() {
   readSeq += 1;
   openDoc = null;
   $("editor-path").textContent = "选择左侧文件查看或编辑";
+  $("editor-input").readOnly = false;
   $("editor-input").hidden = true;
   $("editor-empty").hidden = false;
   $("save-file").disabled = true;
@@ -284,11 +293,30 @@ async function openFile(relPath, force = false, lineNumber = 0) {
   const result = await api(wsPath("read"), "POST", { path: relPath });
   if (selected?.id !== wsId || seq !== readSeq) return;
   const bytes = Uint8Array.from(atob(result.data), (c) => c.charCodeAt(0));
-  const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
-  if (text.includes("\0")) throw new Error("二进制文件暂不支持文本编辑");
-  const crlf = text.includes("\r\n") && !text.replaceAll("\r\n", "").includes("\n");
+  if (bytes.subarray(0, 8192).includes(0)) throw new Error("二进制文件暂不支持文本编辑");
 
   const textarea = $("editor-input");
+  if (bytes.length > MAX_INLINE_EDITOR_BYTES) {
+    const preview = new TextDecoder("utf-8", { fatal: false }).decode(bytes.subarray(0, 64 * 1024));
+    textarea.value = preview;
+    textarea.readOnly = true;
+    openDoc = null;
+    const label = `${relPath}（${(bytes.length / 1024).toFixed(1)} KiB · 只读前 64 KiB 预览）`;
+    $("editor-path").textContent = label;
+    $("editor-path").title = label;
+    $("editor-empty").hidden = true;
+    textarea.hidden = false;
+    $("save-file").disabled = true;
+    $("reload-file").disabled = true;
+    $("editor-dirty").hidden = true;
+    syncActiveTreeRow();
+    return;
+  }
+
+  const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  const crlf = text.includes("\r\n") && !text.replaceAll("\r\n", "").includes("\n");
+
+  textarea.readOnly = false;
   textarea.value = text;
   openDoc = { path: relPath, etag: result.etag, saved: textarea.value, crlf };
   $("editor-path").textContent = relPath;
@@ -661,6 +689,11 @@ if (document.documentElement.dataset.piPluginPanelShape === "view") {
 initAppearanceSync();
 bridge?.on?.("session:activated", () => { void syncSessionState(true); });
 window.addEventListener("focus", () => { void syncSessionState(true); });
-window.setInterval(() => { void syncSessionState(true); }, 2500);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") void syncSessionState(true);
+});
+window.setInterval(() => {
+  if (document.visibilityState !== "hidden") void syncSessionState(true);
+}, 10000);
 
 void runSafe(() => refreshAll(true))();

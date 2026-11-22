@@ -155,6 +155,70 @@ test("pi-web native modal workflows: remote file browser, inline editor, etag co
   assert.equal(await readFile(join(fixture.root, "src/app.ts"), "utf8"), "export const value = 42;\n");
   assert.ok(notices.some(n => n.includes("已保存远程文件：src/app.ts")));
 
+  // 1b. Subdirectory grep in `/remote files` resolves paths relative to `currentDir`,
+  // and inline editor preserves UTF-8 BOM + CRLF while rejecting invalid non-UTF-8 bytes.
+  await writeFile(join(fixture.root, "src/crlf.ts"), "\uFEFFconst a = 1;\r\nconst targetMarker = 2;\r\n", "utf8");
+  await writeFile(join(fixture.root, "src/latin1.txt"), Buffer.from([0x68, 0x69, 0x80, 0xff, 0x0a]));
+
+  // Unmodified textarea return (where browser normalized \r\n -> \n) must NOT rewrite file.
+  const unchangedRes = await openRemoteFileEditor(
+    fixture.client,
+    "src/crlf.ts",
+    {
+      editor: async (_title, prefill) => {
+        assert.equal(prefill, "const a = 1;\nconst targetMarker = 2;\n");
+        return prefill;
+      },
+      confirm: async () => false,
+      notify: msg => notices.push(msg),
+    },
+  );
+  assert.equal(unchangedRes.saved, false);
+  assert.equal(await readFile(join(fixture.root, "src/crlf.ts"), "utf8"), "\uFEFFconst a = 1;\r\nconst targetMarker = 2;\r\n");
+
+  // Non-UTF-8 file without NUL bytes is rejected cleanly without corrupting remote bytes.
+  const nonUtf8Res = await openRemoteFileEditor(
+    fixture.client,
+    "src/latin1.txt",
+    {
+      editor: async () => "should-not-open",
+      confirm: async () => false,
+      notify: msg => notices.push(msg),
+    },
+  );
+  assert.equal(nonUtf8Res.saved, false);
+  assert.ok(notices.some(n => n.includes("非 UTF-8 编码文件")));
+
+  // Browse into `src/`, run grep for `targetMarker`, open hit -> must resolve `src/crlf.ts` and preserve BOM + CRLF on save.
+  const grepSelectQueue = [
+    "📁 src/",
+    "🔎 按内容搜索 (grep)",
+    "__FIRST_GREP_HIT__",
+    undefined,
+  ];
+  await browseRemoteFiles(
+    fixture.client,
+    fixture.root,
+    false,
+    {
+      select: async (_title, options) => {
+        const next = grepSelectQueue.shift();
+        if (next === "__FIRST_GREP_HIT__") {
+          const hit = options.find(o => o.startsWith("crlf.ts:"));
+          assert.ok(hit, `Expected crlf.ts hit in ${JSON.stringify(options)}`);
+          return hit;
+        }
+        if (next) assert.ok(options.includes(next), `Expected ${next} in ${JSON.stringify(options)}`);
+        return next;
+      },
+      input: async () => "targetMarker",
+      editor: async (_title, prefill) => prefill?.replace("targetMarker = 2", "targetMarker = 99"),
+      confirm: async () => false,
+      notify: msg => notices.push(msg),
+    },
+  );
+  assert.equal(await readFile(join(fixture.root, "src/crlf.ts"), "utf8"), "\uFEFFconst a = 1;\r\nconst targetMarker = 99;\r\n");
+
   // 2. Optimistic concurrency conflict prompts confirm before overwriting
   let conflictAsked = false;
   await openRemoteFileEditor(

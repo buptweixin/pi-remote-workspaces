@@ -79,11 +79,32 @@ function WorkspaceDialog({ snapshot, onRefresh, onStartJob, busyWorkspaceId, ban
   const [name, setName] = useState("");
   const [saving, setSaving] = useState(false);
   const [probeInfo, setProbeInfo] = useState(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState("");
+  const dialogMountedRef = useRef(true);
+
+  useEffect(() => {
+    dialogMountedRef.current = true;
+    const onKeyDown = (e) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      dialogMountedRef.current = false;
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [onClose]);
+
+  useEffect(() => {
+    if (!confirmDeleteId) return undefined;
+    const timer = window.setTimeout(() => setConfirmDeleteId(""), 3500);
+    return () => window.clearTimeout(timer);
+  }, [confirmDeleteId]);
 
   const boundWorkspace = snapshot.state?.mode === "remote" ? snapshot.state.binding?.workspace : null;
   const boundProbe = snapshot.state?.mode === "remote" ? snapshot.state.binding?.probe : null;
 
   const openAddForm = (presetHost = "") => {
+    setConfirmDeleteId("");
     setEditingId("");
     setHost(presetHost);
     setPath("");
@@ -93,6 +114,7 @@ function WorkspaceDialog({ snapshot, onRefresh, onStartJob, busyWorkspaceId, ban
   };
 
   const openEditForm = (ws) => {
+    setConfirmDeleteId("");
     setEditingId(ws.id);
     setHost(ws.host);
     setPath(ws.path);
@@ -102,6 +124,7 @@ function WorkspaceDialog({ snapshot, onRefresh, onStartJob, busyWorkspaceId, ban
   };
 
   const handleBind = async (workspaceId) => {
+    setConfirmDeleteId("");
     setBannerError("");
     setProbeInfo(null);
     const res = await callPlugin("remote.bind", { workspaceId });
@@ -113,6 +136,7 @@ function WorkspaceDialog({ snapshot, onRefresh, onStartJob, busyWorkspaceId, ban
   };
 
   const handleUnbind = async () => {
+    setConfirmDeleteId("");
     setBannerError("");
     const res = await callPlugin("remote.unbind", {});
     if (!res?.ok) {
@@ -123,20 +147,29 @@ function WorkspaceDialog({ snapshot, onRefresh, onStartJob, busyWorkspaceId, ban
   };
 
   const handleProbe = async (workspaceId) => {
+    setConfirmDeleteId("");
     setBannerError("");
     setProbeInfo({ workspaceId, text: "正在测试 SSH 连接…" });
     const res = await callPlugin("remote.probe", { workspaceId });
     if (!res?.ok || !res.job) {
+      if (!dialogMountedRef.current) return;
       setProbeInfo(null);
       setBannerError(res?.error || "测试连接失败");
       return;
     }
     const jobId = res.job.id;
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < 360; i++) {
       await new Promise((r) => setTimeout(r, 350));
+      if (!dialogMountedRef.current) return;
       const polled = await callPlugin("remote.job", { jobId });
+      if (!dialogMountedRef.current) return;
       const job = polled?.job;
-      if (!job || job.status === "connecting") continue;
+      if (!job) {
+        setProbeInfo(null);
+        setBannerError("连接测试任务已失效");
+        return;
+      }
+      if (job.status === "connecting") continue;
       if (job.status === "ready" && job.probe) {
         setProbeInfo({
           workspaceId,
@@ -148,9 +181,18 @@ function WorkspaceDialog({ snapshot, onRefresh, onStartJob, busyWorkspaceId, ban
       }
       return;
     }
+    if (dialogMountedRef.current) {
+      setProbeInfo(null);
+      setBannerError("连接测试超时，请检查主机网络或超时配置");
+    }
   };
 
   const handleDelete = async (ws) => {
+    if (confirmDeleteId !== ws.id) {
+      setConfirmDeleteId(ws.id);
+      return;
+    }
+    setConfirmDeleteId("");
     setBannerError("");
     const res = await callPlugin("remote.deleteWorkspace", { workspaceId: ws.id });
     if (!res?.ok) {
@@ -314,8 +356,13 @@ function WorkspaceDialog({ snapshot, onRefresh, onStartJob, busyWorkspaceId, ban
                       ),
                       h(
                         "button",
-                        { type: "button", className: "pir-mini-btn pir-mini-danger", onClick: () => handleDelete(ws), title: "删除配置" },
-                        "删除",
+                        {
+                          type: "button",
+                          className: `pir-mini-btn pir-mini-danger${confirmDeleteId === ws.id ? " is-confirming" : ""}`,
+                          onClick: () => handleDelete(ws),
+                          title: confirmDeleteId === ws.id ? "再次点击确认删除工作区配置" : "删除配置",
+                        },
+                        confirmDeleteId === ws.id ? "确认?" : "删除",
                       ),
                     ),
                   );
@@ -449,11 +496,18 @@ function SshComposerPill() {
     mountedRef.current = true;
     void refresh(false);
     const onFocus = () => void refresh(false);
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") void refresh(false);
+    };
     window.addEventListener("focus", onFocus);
-    const timer = window.setInterval(() => void refresh(false), 2500);
+    document.addEventListener("visibilitychange", onVisibility);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== "hidden") void refresh(false);
+    }, 8000);
     return () => {
       mountedRef.current = false;
       window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
       window.clearInterval(timer);
     };
   }, [refresh]);
@@ -804,8 +858,10 @@ const COMPOSER_CSS = `
   background: var(--ds-bg-active);
   color: var(--ds-text-primary);
 }
-.pir-mini-danger:hover {
+.pir-mini-danger:hover,
+.pir-mini-danger.is-confirming {
   color: var(--ds-error, #f85149);
+  font-weight: var(--font-weight-medium, 500);
 }
 .pir-empty {
   padding: 18px 12px;

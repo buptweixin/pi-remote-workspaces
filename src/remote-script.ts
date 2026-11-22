@@ -2,10 +2,11 @@ export const REMOTE_JSON_SENTINEL = "__PI_REMOTE_JSON__:";
 
 /** Sent over stdin/SSH on demand; nothing is installed on the remote machine. */
 export const remoteScript = String.raw`
-import base64, errno, fcntl, hashlib, json, mimetypes, os, selectors, shutil, signal, stat, subprocess, sys, tempfile, time
+import base64, errno, fcntl, fnmatch, hashlib, json, mimetypes, os, re, selectors, shutil, signal, stat, subprocess, sys, tempfile, time
 
 SENTINEL = "__PI_REMOTE_JSON__:"
 MAX_FILE = 8 * 1024 * 1024
+MAX_STREAM_SCAN = 128 * 1024 * 1024
 MAX_GREP_BYTES = 50 * 1024
 MAX_GREP_LINE = 500
 _UMASK = os.umask(0o077)
@@ -57,6 +58,277 @@ def clean_glob(value):
     while rest.startswith("./"):
         rest = rest[2:]
     return (neg + rest) if rest else "."
+
+def _glob_to_regex(pat):
+    i, n, out = 0, len(pat), ["^"]
+    while i < n:
+        ch = pat[i]
+        if ch == "*":
+            if i + 1 < n and pat[i + 1] == "*":
+                if i + 2 < n and pat[i + 2] == "/":
+                    out.append("(?:.+/)?")
+                    i += 3
+                    continue
+                out.append(".*")
+                i += 2
+                continue
+            out.append("[^/]*")
+        elif ch == "?":
+            out.append("[^/]")
+        elif ch == "[" and "]" in pat[i + 1:]:
+            end = pat.index("]", i + 1)
+            inner = pat[i + 1:end]
+            if inner.startswith("!"):
+                inner = "^" + inner[1:]
+            out.append("[" + inner + "]")
+            i = end
+        elif ch == "{" and "}" in pat[i + 1:]:
+            end = pat.index("}", i + 1)
+            alts = [_glob_to_regex(part)[1:-1] for part in pat[i + 1:end].split(",")]
+            out.append("(?:" + "|".join(alts) + ")")
+            i = end
+        else:
+            out.append(re.escape(ch))
+        i += 1
+    out.append("$")
+    return "".join(out)
+
+def compile_glob_matcher(raw_pattern):
+    cleaned = clean_glob(str(raw_pattern or "*"))
+    negate = cleaned.startswith("!")
+    core = cleaned[1:] if negate else cleaned
+    if not core or core == ".":
+        return lambda _rel: not negate
+    has_slash = "/" in core
+    if not has_slash and "{" not in core and "**" not in core:
+        return lambda rel: (not fnmatch.fnmatchcase(os.path.basename(rel), core)) if negate else fnmatch.fnmatchcase(os.path.basename(rel), core)
+    compiled = re.compile(_glob_to_regex(core))
+    return lambda rel: (compiled.match(rel if has_slash else os.path.basename(rel)) is None) if negate else (compiled.match(rel if has_slash else os.path.basename(rel)) is not None)
+
+def iter_fallback_files(root, search_dir, deadline):
+    if shutil.which("git"):
+        try:
+            proc = subprocess.run(
+                ["git", "-c", "core.quotePath=false", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                cwd=search_dir,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=max(1.0, deadline - time.monotonic()),
+                check=False,
+            )
+            if proc.returncode == 0:
+                entries = []
+                for raw_entry in proc.stdout.split(b"\x00"):
+                    if not raw_entry:
+                        continue
+                    rel = raw_entry.decode("utf8", "replace").replace("\\", "/")
+                    if rel == ".git" or rel.startswith(".git/") or "/.git/" in rel:
+                        continue
+                    full = os.path.join(search_dir, rel)
+                    try:
+                        resolved = os.path.realpath(full)
+                        if os.path.commonpath([root, resolved]) != root or not os.path.isfile(resolved):
+                            continue
+                    except OSError:
+                        continue
+                    entries.append(rel)
+                entries.sort()
+                return entries
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Remote search timed out")
+        except Exception:
+            pass
+    collected = []
+    for cur_dir, dirs, files in os.walk(search_dir, followlinks=False):
+        if time.monotonic() > deadline:
+            raise RuntimeError("Remote search timed out")
+        dirs[:] = sorted(d for d in dirs if d != ".git" and not os.path.islink(os.path.join(cur_dir, d)))
+        for fname in sorted(files):
+            full = os.path.join(cur_dir, fname)
+            try:
+                resolved = os.path.realpath(full)
+                if os.path.commonpath([root, resolved]) != root or not os.path.isfile(resolved):
+                    continue
+            except OSError:
+                continue
+            collected.append(os.path.relpath(full, search_dir).replace("\\", "/"))
+    return collected
+
+def run_find_fallback(root, path, pattern, limit, timeout):
+    deadline = time.monotonic() + max(1, timeout)
+    matcher = compile_glob_matcher(pattern)
+    if not os.path.isdir(path):
+        name = os.path.basename(path)
+        matched = [name] if matcher(name) else []
+        return {"text": "\n".join(matched[:limit]), "exitCode": 0 if matched else 1, "truncated": len(matched) > limit}
+    results, truncated = [], False
+    for rel in iter_fallback_files(root, path, deadline):
+        if time.monotonic() > deadline:
+            raise RuntimeError("Remote search timed out")
+        if not matcher(rel):
+            continue
+        if len(results) >= limit:
+            truncated = True
+            break
+        results.append(rel)
+    return {"text": "\n".join(results), "exitCode": 0 if results else 1, "truncated": truncated}
+
+def run_grep_fallback(root, path, p, limit, timeout):
+    deadline = time.monotonic() + max(1, timeout)
+    is_dir = os.path.isdir(path)
+    context_lines = max(0, min(int(p.get("context") or 0), 10))
+    flags = re.IGNORECASE if p.get("ignoreCase") else 0
+    raw_pat = str(p["pattern"])
+    try:
+        regex = re.compile(re.escape(raw_pat) if p.get("literal") else raw_pat, flags)
+    except re.error as err:
+        raise RuntimeError("Invalid regex pattern: " + str(err))
+    glob_matcher = compile_glob_matcher(p["glob"]) if p.get("glob") else None
+    candidates = iter_fallback_files(root, path, deadline) if is_dir else [os.path.basename(path)]
+    output_lines = []
+    output_bytes, match_count = 0, 0
+    match_limit_reached, byte_truncated, lines_truncated = False, False, False
+
+    def emit_line(rel_label, line_num, line_text, is_match):
+        nonlocal output_bytes, byte_truncated, lines_truncated
+        if len(line_text) > MAX_GREP_LINE:
+            line_text = line_text[:MAX_GREP_LINE] + "... [truncated]"
+            lines_truncated = True
+        sep = ":" if is_match else "-"
+        formatted = f"{rel_label}{sep}{line_num}{sep} {line_text}"
+        encoded_len = len(formatted.encode("utf8")) + (1 if output_lines else 0)
+        if output_bytes + encoded_len > MAX_GREP_BYTES:
+            byte_truncated = True
+            return
+        output_lines.append(formatted)
+        output_bytes += encoded_len
+
+    for rel in candidates:
+        if time.monotonic() > deadline:
+            raise RuntimeError("Remote search timed out")
+        if glob_matcher and not glob_matcher(rel):
+            continue
+        full = os.path.join(path, rel) if is_dir else path
+        try:
+            st = os.stat(full)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_FILE:
+                continue
+            with open(full, "rb") as file:
+                raw_bytes = file.read(MAX_FILE)
+        except OSError:
+            continue
+        if b"\x00" in raw_bytes[:8192]:
+            continue
+        text = raw_bytes.decode("utf8", "replace")
+        lines = text.splitlines()
+        hit_indices = []
+        for idx, line in enumerate(lines):
+            if regex.search(line):
+                hit_indices.append(idx)
+        if not hit_indices:
+            continue
+        accepted_hits = []
+        for idx in hit_indices:
+            if match_count < limit:
+                match_count += 1
+                accepted_hits.append(idx)
+            else:
+                match_limit_reached = True
+                break
+        if accepted_hits:
+            hit_set = set(accepted_hits)
+            shown = set()
+            for h_idx in accepted_hits:
+                for c_idx in range(max(0, h_idx - context_lines), min(len(lines), h_idx + context_lines + 1)):
+                    shown.add(c_idx)
+            for c_idx in sorted(shown):
+                emit_line(rel, c_idx + 1, lines[c_idx], c_idx in hit_set)
+        if match_limit_reached:
+            break
+
+    return {
+        "text": "\n".join(output_lines),
+        "exitCode": 0 if match_count > 0 else 1,
+        "truncated": match_limit_reached or byte_truncated or lines_truncated,
+        "matchLimitReached": limit if match_limit_reached else None,
+        "byteTruncated": byte_truncated,
+        "linesTruncated": lines_truncated,
+    }
+
+def is_image_header(head):
+    if len(head) >= 4 and head[0] == 0xFF and head[1] == 0xD8 and head[2] == 0xFF and head[3] != 0xF7:
+        return True
+    if len(head) >= 16 and head[:8] == b"\x89PNG\r\n\x1a\n":
+        return True
+    if len(head) >= 6 and head[:6] in (b"GIF87a", b"GIF89a"):
+        return True
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return True
+    if len(head) >= 26 and head[:2] == b"BM":
+        return True
+    return False
+
+def read_text_lines(path, offset, limit, max_bytes):
+    if not os.path.exists(path):
+        raise RuntimeError("File not found: " + path)
+    if os.path.isdir(path):
+        raise RuntimeError("Path is a directory: " + path)
+    start = max(1, int(offset or 1))
+    max_lines = max(1, min(5000, int(limit or 2000)))
+    cap_bytes = max(1024, int(max_bytes or 51200))
+    file_size = os.path.getsize(path)
+    if file_size > MAX_STREAM_SCAN:
+        raise RuntimeError("File exceeds 128 MiB; use bash with sed/head/tail to inspect ranges")
+    selected = []
+    sel_bytes = 0
+    truncated_by_bytes = False
+    line_no = 0
+    first_chunk = True
+    remainder = b""
+    end_target = start - 1 + max_lines
+
+    def consume_line(raw_line):
+        nonlocal line_no, sel_bytes, truncated_by_bytes
+        line_no += 1
+        if line_no < start or line_no > end_target or truncated_by_bytes:
+            return
+        decoded = raw_line.rstrip(b"\r").decode("utf8", "replace")
+        if line_no == 1 and decoded.startswith("\ufeff"):
+            decoded = decoded[1:]
+        encoded_len = len(decoded.encode("utf8")) + 1
+        if selected and sel_bytes + encoded_len > cap_bytes:
+            truncated_by_bytes = True
+            return
+        selected.append(decoded)
+        sel_bytes += encoded_len
+
+    with open(path, "rb") as file:
+        while True:
+            chunk = file.read(65536)
+            if not chunk:
+                break
+            if first_chunk:
+                first_chunk = False
+                if file_size <= MAX_FILE and is_image_header(chunk[:32]):
+                    return {"image": True}
+                if b"\x00" in chunk[:8192]:
+                    raise RuntimeError("Binary file cannot be displayed as UTF-8 text: " + path)
+            buf = remainder + chunk
+            parts = buf.split(b"\n")
+            remainder = parts[-1]
+            for raw_line in parts[:-1]:
+                consume_line(raw_line)
+        consume_line(remainder)
+
+    return {
+        "image": False,
+        "text": "\n".join(selected),
+        "startLine": start,
+        "endLine": start + len(selected) - 1,
+        "totalLines": line_no,
+        "truncatedByBytes": truncated_by_bytes,
+    }
 
 def decode_rg(field):
     if not field:
@@ -315,6 +587,8 @@ def main(p):
         with open(path, "rb") as file: data = file.read(MAX_FILE + 1)
         if len(data) > MAX_FILE: raise RuntimeError("File exceeds 8 MiB; use bash to inspect a range")
         return {"data": base64.b64encode(data).decode(), "etag": hashlib.sha256(data).hexdigest()}
+    if op == "read_lines":
+        return read_text_lines(path, p.get("offset", 1), p.get("limit", 2000), p.get("maxBytes", 51200))
     if op == "mkdir":
         os.makedirs(path, exist_ok=True)
         return True
@@ -367,12 +641,12 @@ def main(p):
         return bounded(args, root, timeout=cmd_timeout)
     if op in ["grep", "find"]:
         if not os.path.exists(path): raise RuntimeError("Path not found: " + path)
-        if not shutil.which("rg"): raise RuntimeError("Remote search requires ripgrep (rg). Install it on this host, or use bash with find/grep.")
+        has_rg = bool(shutil.which("rg"))
         if op == "find":
             limit = max(1, min(int(p.get("limit", 1000)), 10000))
-            return run_find(path, p["pattern"], limit, cmd_timeout)
+            return run_find(path, p["pattern"], limit, cmd_timeout) if has_rg else run_find_fallback(root, path, p["pattern"], limit, cmd_timeout)
         limit = max(1, min(int(p.get("limit", 100)), 2000))
-        return run_grep(root, path, p, limit, cmd_timeout)
+        return run_grep(root, path, p, limit, cmd_timeout) if has_rg else run_grep_fallback(root, path, p, limit, cmd_timeout)
     raise RuntimeError("Unknown remote operation: " + op)
 
 _protocol_out = sys.stdout

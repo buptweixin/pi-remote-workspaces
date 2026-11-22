@@ -3,9 +3,9 @@ import test from "node:test";
 import { mkdir, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { runProcess } from "../src/process.js";
-import { RemoteClient } from "../src/remote.js";
+import { RemoteClient, remotePythonCommand } from "../src/remote.js";
 import { defaults } from "../src/config.js";
-import { createRemoteTools, getNativeReadonlyToolFactories, LOCAL_READONLY_TOOL_NAMES, remotePath } from "../src/tools.js";
+import { createRemoteTools, createStandaloneRemoteTools, getNativeReadonlyToolFactories, LOCAL_READONLY_TOOL_NAMES, remotePath } from "../src/tools.js";
 import remoteExtension from "../src/extension.js";
 import type { ExtensionAPI, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { temporary, clientFor, localTransport, workspace } from "./helpers.js";
@@ -243,4 +243,109 @@ test("nativeMode activates read-only local_* tools when bound to remote and deac
   for (const name of LOCAL_READONLY_TOOL_NAMES) {
     assert.equal(activeTools.includes(name), false, `${name} should be deactivated after /remote local`);
   }
+});
+
+test("compressed bootstrap is single-line shell-safe, search works without ripgrep, and >8 MiB text files stream line slices", async t => {
+  for (const loop of [false, true]) {
+    const cmd = remotePythonCommand(loop);
+    assert.equal(cmd.includes("\n"), false, "bootstrap command must be single-line for csh/tcsh");
+    assert.equal(/[$`\\!]/.test(cmd), false, "bootstrap command must not contain $, `, \\, or ! for fish/csh/sh");
+  }
+
+  const outer = await temporary(t);
+  const root = join(outer, "no-rg-workspace");
+  const minimalBin = join(outer, "minimal-bin");
+  await mkdir(join(root, "src/nested"), { recursive: true });
+  await mkdir(join(root, ".git"), { recursive: true });
+  await mkdir(minimalBin, { recursive: true });
+  await writeFile(join(root, ".git/config"), "[core]\n");
+  await writeFile(join(outer, "outside-secret.ts"), "export const needle = 'escaped';\n");
+  await symlink(join(outer, "outside-secret.ts"), join(root, "src/escaped.ts"));
+  await writeFile(join(root, "src/nested/alpha.ts"), "const first = 1;\nconst Needle = 'match-here';\nconst after = 3;\n");
+  await writeFile(join(root, "src/notes.md"), "needle in markdown\n");
+
+  // Locate python3 and expose ONLY python3 in PATH (no rg, no git) so Python fallback is exercised.
+  const whichPy = await runProcess("/bin/sh", ["-c", "command -v python3"]);
+  const pyPath = whichPy.stdout.toString("utf8").trim();
+  assert.ok(pyPath, "python3 must be available in test environment");
+  await symlink(pyPath, join(minimalBin, "python3"));
+
+  // Strip _extra_dir fallback PATH entries by isolating HOME and PATH inside the transport shell.
+  const noRgClient = new RemoteClient(workspace(root), defaults(), async (_prog, args, opts) => {
+    // Override PATH after python starts? No: remoteScript appends /opt/homebrew/bin and /usr/local/bin if present!
+    // Shadow `rg` and `git` with non-executable files? `shutil.which` skips non-executable files!
+    // Instead, run a tiny wrapper or test via python override: wait — let's check how `shutil.which` works!
+    return runProcess("/bin/sh", ["-c", args.at(-1)!], {
+      ...opts,
+      env: { HOME: outer, PATH: minimalBin },
+    });
+  });
+
+  // Note: remoteScript appends /opt/homebrew/bin and /usr/local/bin to PATH for convenience on macOS,
+  // so also verify fallback directly when rg is absent OR via a shadow script if rg is in /opt/homebrew/bin.
+  const probe = await noRgClient.probe();
+  if (probe.ripgrep) {
+    // Place an empty directory first on PATH? shutil.which searches PATH in order; a non-executable doesn't stop search,
+    // so verify Python fallback explicitly by invoking python3 with shutil.which patched for rg/git.
+    const fallbackClient = new RemoteClient(workspace(root), defaults(), async (_prog, args, opts) => {
+      const cmd = args.at(-1)!.replace(
+        'python3 -c "',
+        'python3 -c "import shutil as _s; _orig=_s.which; _s.which=lambda n,*a,**k: None if n in (\'rg\',\'git\') else _orig(n,*a,**k); ',
+      );
+      return runProcess("/bin/sh", ["-c", cmd], opts);
+    });
+    const fallbackProbe = await fallbackClient.probe();
+    assert.equal(fallbackProbe.ripgrep, false);
+    assert.equal(fallbackProbe.git, false);
+
+    const tools = createStandaloneRemoteTools(fallbackClient, fallbackProbe);
+    const foundAll = await tools.remote_find.execute("f1", { pattern: "**/*.ts" }, undefined, undefined, {} as any);
+    const foundText = (foundAll.content[0] as { text: string }).text;
+    assert.match(foundText, /src\/nested\/alpha\.ts/);
+    assert.doesNotMatch(foundText, /escaped\.ts/);
+    assert.doesNotMatch(foundText, /\.git/);
+
+    const grepRes = await tools.remote_grep.execute("g1", {
+      pattern: "needle",
+      ignoreCase: true,
+      glob: "*.ts",
+      context: 1,
+    }, undefined, undefined, {} as any);
+    const grepText = (grepRes.content[0] as { text: string }).text;
+    assert.match(grepText, /src\/nested\/alpha\.ts-1-\s*const first = 1;/);
+    assert.match(grepText, /src\/nested\/alpha\.ts:2:\s*const Needle = 'match-here';/);
+    assert.match(grepText, /src\/nested\/alpha\.ts-3-\s*const after = 3;/);
+    assert.doesNotMatch(grepText, /notes\.md/);
+  } else {
+    const tools = createStandaloneRemoteTools(noRgClient, probe);
+    const foundAll = await tools.remote_find.execute("f1", { pattern: "**/*.ts" }, undefined, undefined, {} as any);
+    assert.match((foundAll.content[0] as { text: string }).text, /src\/nested\/alpha\.ts/);
+    const grepRes = await tools.remote_grep.execute("g1", { pattern: "needle", ignoreCase: true, glob: "*.ts" }, undefined, undefined, {} as any);
+    assert.match((grepRes.content[0] as { text: string }).text, /src\/nested\/alpha\.ts:2:/);
+  }
+
+  // Create an >8 MiB multi-line log file (~8.5 MiB) and verify full read rejects while tool slice reads succeed!
+  const bigPath = join(root, "huge.log");
+  const chunkLine = `${"x".repeat(100)}\n`; // 101 bytes/line
+  const totalLinesCount = 89_000; // ~8.98 MiB > 8 MiB
+  const linesBuf = Buffer.alloc(totalLinesCount * chunkLine.length, chunkLine, "utf8");
+  const markerLine = "SPECIAL_MARKER_AT_LINE_50000                                                                        \n";
+  Buffer.from(markerLine, "utf8").copy(linesBuf, (50_000 - 1) * chunkLine.length);
+  await writeFile(bigPath, linesBuf);
+
+  const client = clientFor(root);
+  const fullProbe = await client.probe();
+  await assert.rejects(client.read("huge.log"), /File exceeds 8 MiB/);
+
+  const standaloneTools = createStandaloneRemoteTools(client, fullProbe);
+  const desktopSlice = await standaloneTools.remote_read.execute("sr", { path: "huge.log", offset: 49_999, limit: 3 }, undefined, undefined, {} as any);
+  const desktopSliceText = (desktopSlice.content[0] as { text: string }).text;
+  assert.match(desktopSliceText, /SPECIAL_MARKER_AT_LINE_50000/);
+  assert.match(desktopSliceText, /Showing lines 49999-50001 of 89001/);
+
+  const nativeTools = createRemoteTools(client, fullProbe);
+  const nativeSlice = await nativeTools.read!.execute("nr", { path: "huge.log", offset: 50_000, limit: 2 }, undefined, undefined, { cwd: "/unused" } as ExtensionToolContext);
+  const nativeSliceText = (nativeSlice.content[0] as { text: string }).text;
+  assert.match(nativeSliceText, /SPECIAL_MARKER_AT_LINE_50000/);
+  assert.match(nativeSliceText, /Showing lines 50000-50001 of 89001/);
 });

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { ConfigStore } from "./config.js";
+import { ConfigStore, SessionBindingStore, sessionStateFile } from "./config.js";
 import { removeWorkspaceAnchorIfEmpty, syncWorkspaceAnchors, workspaceAnchorDir } from "./anchors.js";
 import { discoverHosts } from "./ssh-config.js";
 import { RemoteClient } from "./remote.js";
@@ -36,6 +36,7 @@ async function main(args = process.argv.slice(2)) {
     const target = config.workspaces.find(w => w.id === rest[0]);
     if (!target) throw new Error(`Unknown workspace: ${rest[0]}`);
     await store.update(current => ({ ...current, workspaces: current.workspaces.filter(w => w.id !== target.id) }));
+    await new SessionBindingStore(sessionStateFile(store.file)).clearWorkspace(target.id);
     await removeWorkspaceAnchorIfEmpty(target.id, config, store.file);
     console.log(`Removed workspace: ${target.id}`); return;
   }
