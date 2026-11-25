@@ -250,6 +250,14 @@ function applyTextEdits(path: string, rawBuffer: Buffer, edits: Array<{ oldText:
   };
 }
 
+function truncateUtf8Prefix(text: string, maxBytes: number): { text: string; truncated: boolean } {
+  const buf = Buffer.from(text, "utf8");
+  if (buf.length <= maxBytes) return { text, truncated: false };
+  let end = maxBytes;
+  while (end > 0 && (buf[end]! & 0b1100_0000) === 0b1000_0000) end--;
+  return { text: buf.subarray(0, end).toString("utf8"), truncated: true };
+}
+
 function tailBytesUtf8(chunks: Buffer[], maxBytes: number): { text: string; truncated: boolean } {
   const full = Buffer.concat(chunks);
   if (full.length <= maxBytes) return { text: full.toString("utf8"), truncated: false };
@@ -359,6 +367,7 @@ export function createStandaloneRemoteTools(
   client: RemoteClient,
   probe: Pick<Probe, "root" | "home">,
   signal?: AbortSignal,
+  onMutatePath?: (path: string) => void,
 ): Record<RemoteDesktopToolName, ToolDefinition<any, any>> {
   const norm = (value: unknown, fallback = ".") => remotePath(typeof value === "string" && value.trim() ? value : fallback, probe.home);
 
@@ -418,6 +427,13 @@ export function createStandaloneRemoteTools(
         for (let idx = start - 1; idx < endLimit; idx++) {
           const line = lines[idx]!;
           const lineBytes = Buffer.byteLength(line, "utf8") + 1;
+          if (selected.length === 0 && lineBytes > MAX_TOOL_TEXT_BYTES) {
+            const clipped = truncateUtf8Prefix(line, MAX_TOOL_TEXT_BYTES);
+            selected.push(clipped.text);
+            bytes = Buffer.byteLength(clipped.text, "utf8");
+            truncatedByBytes = true;
+            break;
+          }
           if (selected.length > 0 && bytes + lineBytes > MAX_TOOL_TEXT_BYTES) {
             truncatedByBytes = true;
             break;
@@ -444,6 +460,7 @@ export function createStandaloneRemoteTools(
         const target = norm(params.path);
         const content = String(params.content ?? "");
         await client.write(target, content, undefined, activeSignal);
+        onMutatePath?.(target);
         const bytes = Buffer.byteLength(content, "utf8");
         return {
           content: [{ type: "text", text: `Successfully wrote ${bytes} bytes to remote file ${target}` }],
@@ -468,6 +485,7 @@ export function createStandaloneRemoteTools(
         const preflight = await client.rpc<{ data: string; etag: string }>("read", { path: target, writable: true }, activeSignal);
         const { updated, diff } = applyTextEdits(target, Buffer.from(preflight.data, "base64"), edits);
         await client.write(target, updated, preflight.etag, activeSignal);
+        onMutatePath?.(target);
         return {
           content: [{ type: "text", text: `Edited remote file ${target} (${edits.length} change${edits.length > 1 ? "s" : ""}):\n\n${diff}` }],
           details: { path: target, diff, editsApplied: edits.length },
@@ -570,7 +588,12 @@ export function createStandaloneRemoteTools(
 }
 
 /** Keep the SDK's validation, edit diffs, images, truncation and renderers while minimizing SSH round-trips. */
-export function createRemoteTools(client: RemoteClient, probe: Pick<Probe, "root" | "home">, signal?: AbortSignal): Record<string, ToolDefinition<any, any>> {
+export function createRemoteTools(
+  client: RemoteClient,
+  probe: Pick<Probe, "root" | "home">,
+  signal?: AbortSignal,
+  onMutatePath?: (path: string) => void,
+): Record<string, ToolDefinition<any, any>> {
   const root = probe.root;
   const normalizeArgs = (params: unknown) => {
     const args = params as Record<string, unknown>;
@@ -591,6 +614,12 @@ export function createRemoteTools(client: RemoteClient, probe: Pick<Probe, "root
       async execute(id, params, toolSignal, update, ctx) {
         const activeSignal = toolSignal ?? signal;
         const normalized = normalizeArgs(params) as { path?: string; offset?: number; limit?: number };
+        if (typeof normalized?.path === "string" && (normalized.offset !== undefined || normalized.limit !== undefined)) {
+          const start = Math.max(1, normalized.offset ?? 1);
+          const maxLines = Math.max(1, Math.min(5000, normalized.limit ?? MAX_READ_LINES));
+          const slice = await client.readLines(normalized.path, { offset: start, limit: maxLines, maxBytes: MAX_TOOL_TEXT_BYTES }, activeSignal);
+          if (!slice.image) return formatRemoteSliceResult(normalized.path, slice, start);
+        }
         let cached: { path: string; buffer: Buffer } | undefined;
         const load = async (path: string) => {
           if (cached?.path === path) return cached.buffer;
@@ -631,7 +660,10 @@ export function createRemoteTools(client: RemoteClient, probe: Pick<Probe, "root
         const impl = codingAgent.createWriteToolDefinition(root, {
           operations: {
             mkdir: async () => {},
-            writeFile: async (path, content) => { await client.write(path, content, undefined, activeSignal); },
+            writeFile: async (path, content) => {
+              await client.write(path, content, undefined, activeSignal);
+              onMutatePath?.(path);
+            },
           },
         }) as ToolDefinition<any, any>;
         return impl.execute(id, normalizeArgs(params), activeSignal, update, { ...ctx, cwd: root });
@@ -661,6 +693,7 @@ export function createRemoteTools(client: RemoteClient, probe: Pick<Probe, "root
             writeFile: async (path, content) => {
               if (!etag) throw new Error("Missing conflict token before remote edit write");
               await client.write(path, content, etag, activeSignal);
+              onMutatePath?.(path);
             },
           },
         }) as ToolDefinition<any, any>;

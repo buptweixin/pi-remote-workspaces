@@ -1,3 +1,5 @@
+const FALLBACK_PRUNE_DIRS = new Set([".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".next", ".nuxt", "target", ".gradle"]);
+
 export const REMOTE_JSON_SENTINEL = "__PI_REMOTE_JSON__:";
 
 /** Sent over stdin/SSH on demand; nothing is installed on the remote machine. */
@@ -9,6 +11,8 @@ MAX_FILE = 8 * 1024 * 1024
 MAX_STREAM_SCAN = 128 * 1024 * 1024
 MAX_GREP_BYTES = 50 * 1024
 MAX_GREP_LINE = 500
+FALLBACK_PRUNE_DIRS = ${JSON.stringify([...FALLBACK_PRUNE_DIRS])}
+_PRUNE_SET = set(FALLBACK_PRUNE_DIRS)
 _UMASK = os.umask(0o077)
 os.umask(_UMASK)
 for _extra_dir in (os.path.expanduser("~/.local/bin"), os.path.expanduser("~/.cargo/bin"), "/opt/homebrew/bin", "/usr/local/bin"):
@@ -134,16 +138,17 @@ def iter_fallback_files(root, search_dir, deadline):
                         continue
                     entries.append(rel)
                 entries.sort()
-                return entries
+                for item in entries:
+                    yield item
+                return
         except subprocess.TimeoutExpired:
             raise RuntimeError("Remote search timed out")
         except Exception:
             pass
-    collected = []
     for cur_dir, dirs, files in os.walk(search_dir, followlinks=False):
         if time.monotonic() > deadline:
             raise RuntimeError("Remote search timed out")
-        dirs[:] = sorted(d for d in dirs if d != ".git" and not os.path.islink(os.path.join(cur_dir, d)))
+        dirs[:] = sorted(d for d in dirs if d not in _PRUNE_SET and not os.path.islink(os.path.join(cur_dir, d)))
         for fname in sorted(files):
             full = os.path.join(cur_dir, fname)
             try:
@@ -152,8 +157,7 @@ def iter_fallback_files(root, search_dir, deadline):
                     continue
             except OSError:
                 continue
-            collected.append(os.path.relpath(full, search_dir).replace("\\", "/"))
-    return collected
+            yield os.path.relpath(full, search_dir).replace("\\", "/")
 
 def run_find_fallback(root, path, pattern, limit, timeout):
     deadline = time.monotonic() + max(1, timeout)
@@ -269,6 +273,14 @@ def is_image_header(head):
         return True
     return False
 
+def _truncate_utf8_prefix(raw_bytes, max_bytes):
+    if len(raw_bytes) <= max_bytes:
+        return raw_bytes.decode("utf8", "replace"), False
+    sliced = raw_bytes[:max_bytes]
+    # Trim incomplete trailing UTF-8 multibyte sequence cleanly.
+    text = sliced.decode("utf8", "ignore")
+    return text, True
+
 def read_text_lines(path, offset, limit, max_bytes):
     if not os.path.exists(path):
         raise RuntimeError("File not found: " + path)
@@ -286,18 +298,27 @@ def read_text_lines(path, offset, limit, max_bytes):
     line_no = 0
     first_chunk = True
     remainder = b""
+    remainder_capped = False
     end_target = start - 1 + max_lines
+    max_line_buf = cap_bytes + 4096
 
-    def consume_line(raw_line):
+    def consume_line(raw_line, was_capped=False):
         nonlocal line_no, sel_bytes, truncated_by_bytes
         line_no += 1
         if line_no < start or line_no > end_target or truncated_by_bytes:
             return
-        decoded = raw_line.rstrip(b"\r").decode("utf8", "replace")
-        if line_no == 1 and decoded.startswith("\ufeff"):
-            decoded = decoded[1:]
+        clean = raw_line.rstrip(b"\r")
+        if line_no == 1 and clean.startswith(b"\xef\xbb\xbf"):
+            clean = clean[3:]
+        if not selected and (was_capped or len(clean) > cap_bytes):
+            prefix_text, _ = _truncate_utf8_prefix(clean, cap_bytes)
+            selected.append(prefix_text)
+            sel_bytes = len(prefix_text.encode("utf8"))
+            truncated_by_bytes = True
+            return
+        decoded = clean.decode("utf8", "replace")
         encoded_len = len(decoded.encode("utf8")) + 1
-        if selected and sel_bytes + encoded_len > cap_bytes:
+        if selected and (was_capped or sel_bytes + encoded_len > cap_bytes):
             truncated_by_bytes = True
             return
         selected.append(decoded)
@@ -314,12 +335,60 @@ def read_text_lines(path, offset, limit, max_bytes):
                     return {"image": True}
                 if b"\x00" in chunk[:8192]:
                     raise RuntimeError("Binary file cannot be displayed as UTF-8 text: " + path)
-            buf = remainder + chunk
-            parts = buf.split(b"\n")
-            remainder = parts[-1]
-            for raw_line in parts[:-1]:
-                consume_line(raw_line)
-        consume_line(remainder)
+            # Fast C-level newline scan once past requested window or before reaching start window.
+            if truncated_by_bytes or line_no >= end_target:
+                line_no += chunk.count(b"\n")
+                continue
+            nl_count = chunk.count(b"\n")
+            if nl_count == 0:
+                if line_no + 1 >= start:
+                    if not remainder_capped:
+                        if len(remainder) + len(chunk) > max_line_buf:
+                            keep = max(0, max_line_buf - len(remainder))
+                            remainder += chunk[:keep]
+                            remainder_capped = True
+                        else:
+                            remainder += chunk
+                continue
+            if line_no + nl_count < start - 1:
+                line_no += nl_count
+                last_nl = chunk.rfind(b"\n")
+                tail = chunk[last_nl + 1:]
+                if len(tail) > max_line_buf:
+                    remainder = tail[:max_line_buf]
+                    remainder_capped = True
+                else:
+                    remainder = tail
+                    remainder_capped = False
+                continue
+            parts = chunk.split(b"\n")
+            first_part = parts[0]
+            if remainder_capped:
+                full_first = remainder
+            elif len(remainder) + len(first_part) > max_line_buf:
+                full_first = (remainder + first_part[:max(0, max_line_buf - len(remainder))])
+                remainder_capped = True
+            else:
+                full_first = remainder + first_part
+            consume_line(full_first, remainder_capped)
+            remainder = b""
+            remainder_capped = False
+            for raw_line in parts[1:-1]:
+                if truncated_by_bytes or line_no >= end_target:
+                    line_no += 1
+                else:
+                    consume_line(raw_line, False)
+            last_part = parts[-1]
+            if not (truncated_by_bytes or line_no >= end_target):
+                if len(last_part) > max_line_buf:
+                    remainder = last_part[:max_line_buf]
+                    remainder_capped = True
+                else:
+                    remainder = last_part
+        if truncated_by_bytes or line_no >= end_target:
+            line_no += 1
+        else:
+            consume_line(remainder, remainder_capped)
 
     return {
         "image": False,
@@ -516,7 +585,81 @@ def run_grep(root, path, p, limit, timeout):
         child.stdout.close()
         child.stderr.close()
 
-def main(p):
+def run_bash(p, req_id, watch_stdin):
+    raw_cwd = p.get("cwd") if p.get("cwd") is not None else p["root"]
+    expanded_cwd = os.path.expanduser(str(raw_cwd))
+    if not os.path.isabs(expanded_cwd):
+        expanded_cwd = os.path.join(os.path.realpath(os.path.expanduser(p["root"])), expanded_cwd)
+    if not os.path.isdir(expanded_cwd):
+        err_msg = f"bash: cd: {raw_cwd}: No such file or directory\n"
+        emit_stream(req_id, "stderr", err_msg.encode("utf8"))
+        return {"exitCode": 1}
+    shell_bin = shutil.which("bash")
+    shell_args = [shell_bin, "-lc", str(p["command"])] if shell_bin else ["/bin/sh", "-c", str(p["command"])]
+    child = subprocess.Popen(
+        shell_args,
+        cwd=expanded_cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    selector = selectors.DefaultSelector()
+    selector.register(child.stdout, selectors.EVENT_READ)
+    selector.register(child.stderr, selectors.EVENT_READ)
+    stdin_fd = None
+    if watch_stdin:
+        try:
+            fd = sys.stdin.fileno()
+            mode = os.fstat(fd).st_mode
+            if stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode):
+                selector.register(fd, selectors.EVENT_READ)
+                stdin_fd = fd
+        except Exception:
+            stdin_fd = None
+    timeout_sec = max(1.0, float(p.get("timeout", 120)) + 5.0)
+    deadline = time.monotonic() + timeout_sec
+    client_disconnected = False
+    try:
+        while True:
+            active_pipes = [k for k in selector.get_map().values() if k.fileobj in (child.stdout, child.stderr)]
+            if not active_pipes:
+                break
+            if time.monotonic() > deadline:
+                raise RuntimeError("Remote subprocess timed out")
+            for key, _ in selector.select(0.2):
+                if stdin_fd is not None and key.fileobj == stdin_fd:
+                    try:
+                        probe_in = os.read(stdin_fd, 4096)
+                    except OSError:
+                        probe_in = b""
+                    if not probe_in:
+                        client_disconnected = True
+                        break
+                    continue
+                data = os.read(key.fileobj.fileno(), 32768)
+                if not data:
+                    selector.unregister(key.fileobj)
+                    continue
+                stream_name = "stdout" if key.fileobj is child.stdout else "stderr"
+                emit_stream(req_id, stream_name, data)
+            if client_disconnected:
+                break
+        if client_disconnected:
+            kill_group(child)
+            os._exit(0)
+        code = child.wait(timeout=max(0.1, deadline - time.monotonic()))
+        return {"exitCode": code}
+    finally:
+        selector.close()
+        kill_group(child)
+        child.stdout.close()
+        child.stderr.close()
+
+def main(p, req_id=None, watch_stdin=False):
+    op = p["op"]
+    if op == "bash":
+        return run_bash(p, req_id, watch_stdin)
     root = os.path.realpath(os.path.expanduser(p["root"]))
     if not os.path.isdir(root):
         raise RuntimeError("Workspace directory does not exist: " + root)
@@ -528,8 +671,19 @@ def main(p):
         if os.path.commonpath([root, target]) != root:
             raise RuntimeError("Path escapes the remote workspace (including symlinks): " + value)
         return target
-    op = p["op"]
-    path = safe(p.get("path", "."))
+    def safe_lexical(value):
+        if "\x00" in value:
+            raise RuntimeError("NUL in path")
+        normalized = os.path.normpath(os.path.join(root, os.path.expanduser(value)))
+        if os.path.commonpath([root, normalized]) != root:
+            raise RuntimeError("Path escapes the remote workspace: " + value)
+        if normalized == root:
+            return root
+        parent_real = os.path.realpath(os.path.dirname(normalized))
+        if os.path.commonpath([root, parent_real]) != root:
+            raise RuntimeError("Path escapes the remote workspace (including symlinks): " + value)
+        return os.path.join(parent_real, os.path.basename(normalized))
+    path = safe(p.get("path", ".")) if op not in ("rename", "delete") else root
     if op == "probe":
         return {"root": root, "home": os.path.expanduser("~"), "hostname": os.uname().nodename, "python": sys.version.split()[0], "git": bool(shutil.which("git")), "ripgrep": bool(shutil.which("rg"))}
     if op == "context":
@@ -584,13 +738,48 @@ def main(p):
         if os.path.isdir(path): raise RuntimeError("Path is a directory: " + path)
         if p.get("writable") and not os.access(path, os.R_OK | os.W_OK):
             raise RuntimeError("File is not writable: " + path)
+        max_editable = int(p.get("maxEditableBytes") or 0)
+        if max_editable > 0:
+            total_bytes = os.path.getsize(path)
+            if total_bytes > max_editable:
+                preview_cap = max(4096, min(int(p.get("previewBytes") or 65536), 524288))
+                with open(path, "rb") as file:
+                    head = file.read(preview_cap)
+                return {"data": base64.b64encode(head).decode(), "etag": "", "preview": True, "totalBytes": total_bytes}
         with open(path, "rb") as file: data = file.read(MAX_FILE + 1)
         if len(data) > MAX_FILE: raise RuntimeError("File exceeds 8 MiB; use bash to inspect a range")
         return {"data": base64.b64encode(data).decode(), "etag": hashlib.sha256(data).hexdigest()}
     if op == "read_lines":
         return read_text_lines(path, p.get("offset", 1), p.get("limit", 2000), p.get("maxBytes", 51200))
     if op == "mkdir":
+        if os.path.exists(path) and not os.path.isdir(path):
+            raise RuntimeError("File already exists at path: " + p.get("path", path))
         os.makedirs(path, exist_ok=True)
+        return True
+    if op == "rename":
+        src = safe_lexical(p["path"])
+        dst = safe_lexical(p["newPath"])
+        if src == root or dst == root:
+            raise RuntimeError("Cannot rename workspace root")
+        if not os.path.lexists(src):
+            raise RuntimeError("Path not found: " + p["path"])
+        if os.path.lexists(dst):
+            raise RuntimeError("Target already exists: " + p["newPath"])
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        os.rename(src, dst)
+        return True
+    if op == "delete":
+        target = safe_lexical(p["path"])
+        if target == root:
+            raise RuntimeError("Cannot delete workspace root")
+        if not os.path.lexists(target):
+            raise RuntimeError("Path not found: " + p["path"])
+        if os.path.islink(target) or not os.path.isdir(target):
+            os.unlink(target)
+        elif p.get("recursive"):
+            shutil.rmtree(target)
+        else:
+            os.rmdir(target)
         return True
     if op == "write":
         data = base64.b64decode(p["data"], validate=True)
@@ -656,9 +845,18 @@ def emit(payload):
     _protocol_out.write(SENTINEL + json.dumps(payload) + "\n")
     _protocol_out.flush()
 
+def emit_stream(req_id, stream, raw_bytes):
+    payload = {"stream": stream, "data": base64.b64encode(raw_bytes).decode("ascii")}
+    if req_id is not None:
+        payload["id"] = req_id
+    emit(payload)
+
 if "--loop" in sys.argv[1:]:
     emit({"ready": True})
-    for raw_line in sys.stdin:
+    while True:
+        raw_line = sys.stdin.readline()
+        if not raw_line:
+            break
         raw_line = raw_line.strip()
         if not raw_line:
             continue
@@ -666,13 +864,13 @@ if "--loop" in sys.argv[1:]:
         try:
             request = json.loads(raw_line)
             req_id = request.get("id")
-            emit({"id": req_id, "ok": True, "value": main(request)})
+            emit({"id": req_id, "ok": True, "value": main(request, req_id=req_id, watch_stdin=True)})
         except Exception as error:
             emit({"id": req_id, "ok": False, "error": str(error)})
 else:
     try:
         request = json.load(sys.stdin)
-        emit({"ok": True, "value": main(request)})
+        emit({"ok": True, "value": main(request, req_id=None, watch_stdin=False)})
     except Exception as error:
         emit({"ok": False, "error": str(error)})
 `;

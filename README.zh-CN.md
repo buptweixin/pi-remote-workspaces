@@ -13,7 +13,7 @@
 
 ## 环境
 
-本机：Node.js **≥ 22.19**，系统 `ssh`；远端：Linux/macOS、**Python 3.8+** 和 `bash`。远端推荐安装 `ripgrep` (`rg`) 以获得最快搜索性能（未安装时自动降级为 `git ls-files` / Python 搜索）；Git 面板需要远端安装 `git`。
+本机：Node.js **≥ 22.19**，系统 `ssh`；远端：Linux/macOS、**Python 3.8+** 和 `bash`（未安装 `bash` 时自动回退到 `/bin/sh`）。远端推荐安装 `ripgrep` (`rg`) 以获得最快搜索性能（未安装时自动降级为 `git ls-files` / Python 搜索）；Git 面板需要远端安装 `git`。
 
 先在终端确认登录与主机指纹：
 
@@ -21,7 +21,7 @@
 ssh your-ssh-alias
 ```
 
-插件使用 `BatchMode=yes` 和 `StrictHostKeyChecking=yes`，需要已信任的主机以及密钥或 ssh-agent。密码、交互式 MFA 和首次主机指纹确认应在终端完成。
+插件使用 `BatchMode=yes`，并在 SSH 配置未显式指定时默认启用 `StrictHostKeyChecking=yes`（同时尊重你在 `~/.ssh/config` 中显式配置的 `StrictHostKeyChecking` 与 `ConnectTimeout`）。密码、交互式 MFA 和首次主机指纹确认应在终端完成。
 
 ## 安装
 

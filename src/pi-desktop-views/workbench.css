@@ -507,6 +507,83 @@ code, pre, .wb-mono {
   padding: 7px 8px;
   border-bottom: 1px solid var(--border);
 }
+.wb-glob-input {
+  max-width: 112px;
+  flex: 0 1 112px !important;
+}
+.wb-entry.is-escaped {
+  opacity: 0.55;
+  color: var(--warn);
+}
+.wb-git-branch {
+  color: var(--fg);
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.wb-git-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 0;
+}
+.wb-git-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--fg);
+  text-align: left;
+  cursor: pointer;
+}
+.wb-git-main:hover {
+  background: var(--surface-hover);
+}
+.wb-git-code {
+  min-width: 22px;
+  text-align: center;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--surface-active);
+  color: var(--git-hunk);
+  font-size: 10.5px;
+}
+.wb-git-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wb-diff-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 6px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.wb-diff-title {
+  color: var(--fg);
+  font-weight: 600;
+}
+.wb-diff-file {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 3px 6px;
+  border: 0;
+  border-radius: 4px;
+  background: var(--surface-raised);
+  color: var(--git-hunk);
+  text-align: left;
+  cursor: pointer;
+}
+.wb-diff-file:hover {
+  background: var(--surface-active);
+}
 .wb-input {
   flex: 1;
   min-width: 120px;

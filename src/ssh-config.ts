@@ -81,16 +81,15 @@ export async function sshConfigSignature(config: Pick<RemoteConfig, "sshConfigPa
   const candidates = trackedFiles?.length
     ? trackedFiles
     : config.sshConfigPath ? [config.sshConfigPath] : [resolve(home, ".ssh/config"), systemConfig];
-  const parts: string[] = [];
   const targets = [...new Set([...candidates, ...candidates.map(file => dirname(file))])];
-  for (const file of targets) {
+  const parts = await Promise.all(targets.map(async file => {
     try {
       const info = await stat(file);
-      parts.push(`${file}:${info.ino}:${info.size}:${info.mtimeMs}`);
+      return `${file}:${info.ino}:${info.size}:${info.mtimeMs}`;
     } catch {
-      parts.push(`${file}:missing`);
+      return `${file}:missing`;
     }
-  }
+  }));
   if (!trackedFiles?.length) {
     try {
       const inventory = await discoverHosts(config, home, systemConfig);
@@ -100,17 +99,53 @@ export async function sshConfigSignature(config: Pick<RemoteConfig, "sshConfigPa
   return { signature: parts.join("|"), files: [...candidates] };
 }
 
-export function sshArgs(config: RemoteConfig): string[] {
+export interface HostOptionOverrides {
+  hasExplicitStrictHostKeyChecking?: boolean;
+  hasExplicitConnectTimeout?: boolean;
+  hasExplicitServerAliveInterval?: boolean;
+  hasExplicitServerAliveCountMax?: boolean;
+}
+
+export function sshArgs(config: RemoteConfig, overrides?: HostOptionOverrides): string[] {
   return [
     ...(config.sshConfigPath ? ["-F", config.sshConfigPath] : []),
-    "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-    "-o", `ConnectTimeout=${config.connectTimeoutSeconds}`,
-    "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+    "-T", "-o", "BatchMode=yes",
+    ...(overrides?.hasExplicitStrictHostKeyChecking ? [] : ["-o", "StrictHostKeyChecking=yes"]),
+    ...(overrides?.hasExplicitConnectTimeout && config.connectTimeoutSeconds === 10 ? [] : ["-o", `ConnectTimeout=${config.connectTimeoutSeconds}`]),
+    ...(overrides?.hasExplicitServerAliveInterval ? [] : ["-o", "ServerAliveInterval=15"]),
+    ...(overrides?.hasExplicitServerAliveCountMax ? [] : ["-o", "ServerAliveCountMax=3"]),
   ];
 }
+
+export async function inspectHostOptionOverrides(host: string, config: RemoteConfig, signal?: AbortSignal): Promise<HostOptionOverrides> {
+  validateHost(host);
+  const baseArgs = [...(config.sshConfigPath ? ["-F", config.sshConfigPath] : []), "-G", "--", host];
+  const result = await runProcess("ssh", baseArgs, { signal, timeoutMs: 5_000 });
+  if (result.exitCode) return {};
+  const map = new Map<string, string>();
+  for (const line of result.stdout.toString("utf8").split(/\r?\n/)) {
+    const space = line.indexOf(" ");
+    if (space > 0 && !map.has(line.slice(0, space))) {
+      map.set(line.slice(0, space), line.slice(space + 1).trim());
+    }
+  }
+  const strict = map.get("stricthostkeychecking")?.toLowerCase();
+  const connectTimeout = Number(map.get("connecttimeout") ?? "0");
+  const aliveInterval = Number(map.get("serveraliveinterval") ?? "0");
+  const aliveCountMax = Number(map.get("serveralivecountmax") ?? "3");
+  return {
+    // OpenSSH defaults to `ask` when unconfigured; honor explicit `yes`, `no`, or `accept-new` in ssh_config.
+    hasExplicitStrictHostKeyChecking: Boolean(strict && strict !== "ask"),
+    hasExplicitConnectTimeout: Number.isFinite(connectTimeout) && connectTimeout > 0,
+    hasExplicitServerAliveInterval: Number.isFinite(aliveInterval) && aliveInterval > 0,
+    hasExplicitServerAliveCountMax: Number.isFinite(aliveInterval) && aliveInterval > 0 && Number.isFinite(aliveCountMax) && aliveCountMax > 0,
+  };
+}
+
 export async function resolveHost(host: string, config: RemoteConfig, signal?: AbortSignal): Promise<Record<string, string[]>> {
   validateHost(host);
-  const result = await runProcess("ssh", [...sshArgs(config), "-G", "--", host], { signal, timeoutMs: 10_000 });
+  const overrides = await inspectHostOptionOverrides(host, config, signal).catch(() => ({}));
+  const result = await runProcess("ssh", [...sshArgs(config, overrides), "-G", "--", host], { signal, timeoutMs: 10_000 });
   if (result.exitCode) throw new Error(result.stderr.toString() || "ssh -G failed");
   const resolved: Record<string, string[]> = {};
   for (const line of result.stdout.toString().split("\n")) {

@@ -13,7 +13,7 @@ SSH workspaces for **pi coding agent**, **pi-web**, and **[PI-Desktop](https://g
 
 ## Requirements
 
-**Local:** Node.js **22.19 or later** and the system `ssh` client. **Remote:** Linux or macOS with **Python 3.8+** and `bash`. `ripgrep` (`rg`) is recommended for fast remote search (automatically falls back to `git ls-files` / Python search when absent); the Git panel requires `git` on the remote host.
+**Local:** Node.js **22.19 or later** and the system `ssh` client. **Remote:** Linux or macOS with **Python 3.8+** and `bash` (falls back to `/bin/sh` when `bash` is absent). `ripgrep` (`rg`) is recommended for fast remote search (automatically falls back to `git ls-files` / Python search when absent); the Git panel requires `git` on the remote host.
 
 First, confirm authentication and the host fingerprint in your terminal:
 
@@ -21,7 +21,7 @@ First, confirm authentication and the host fingerprint in your terminal:
 ssh your-ssh-alias
 ```
 
-The extension uses `BatchMode=yes` and `StrictHostKeyChecking=yes`. Prepare a trusted host key and SSH key or ssh-agent authentication before connecting. Password prompts, interactive MFA, and first-time host-key confirmation must be handled in the terminal.
+The extension uses `BatchMode=yes` and defaults to `StrictHostKeyChecking=yes` when your SSH config leaves host-key checking at `ask` (while honoring explicit `StrictHostKeyChecking` or `ConnectTimeout` rules configured per host). Prepare a trusted host key and SSH key or ssh-agent authentication before connecting. Password prompts, interactive MFA, and first-time host-key confirmation must be handled in the terminal.
 
 ## Install
 

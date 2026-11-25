@@ -2,24 +2,45 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { deflateSync } from "node:zlib";
 import { validateHost, type RemoteConfig, type Workspace } from "./config.js";
 import { killProcessGroup, ProcessAbortError, ProcessTimeoutError, runProcess, shellQuote, sshChildEnv, type RunOptions, type RunResult } from "./process.js";
-import { sshArgs, sshConfigSignature } from "./ssh-config.js";
+import { inspectHostOptionOverrides, sshArgs, sshConfigSignature, type HostOptionOverrides } from "./ssh-config.js";
 import { REMOTE_JSON_SENTINEL, remoteScript } from "./remote-script.js";
 
 const COMPRESSED_REMOTE_SCRIPT = deflateSync(Buffer.from(remoteScript, "utf8")).toString("base64");
+const BOOTSTRAP_CODE = `import base64,zlib;exec(compile(zlib.decompress(base64.b64decode('${COMPRESSED_REMOTE_SCRIPT}')),'<pi-remote>','exec'))`;
 
 /**
  * Single-line ASCII bootstrap free of newlines, backslashes, `$`, or nested double quotes so
  * non-POSIX remote login shells (`fish`, `csh`, `tcsh`, `zsh`, `sh`) invoke Python identically.
  */
 export function remotePythonCommand(loop: boolean): string {
-  const bootstrap = `import base64,zlib;exec(compile(zlib.decompress(base64.b64decode('${COMPRESSED_REMOTE_SCRIPT}')),'<pi-remote>','exec'))`;
-  return loop ? `python3 -u -c "${bootstrap}" --loop` : `python3 -c "${bootstrap}"`;
+  return loop ? `python3 -u -c "${BOOTSTRAP_CODE}" --loop` : `python3 -c "${BOOTSTRAP_CODE}"`;
+}
+
+/**
+ * POSIX `/bin/sh` fallback used only when a remote host's non-login PATH omits `python3`
+ * (e.g. macOS Homebrew `/opt/homebrew/bin/python3`, `/usr/local/bin/python3`, or `~/.local/bin`).
+ */
+function remoteFallbackShPythonCommand(loop: boolean): string {
+  const flags = loop ? "-u -c" : "-c";
+  const tail = loop ? " --loop" : "";
+  const script = [
+    'for p in "$HOME/.local/bin/python3" /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do',
+    '  if [ -x "$p" ] && "$p" -c "import sys" >/dev/null 2>&1; then exec "$p" ' + flags + " " + shellQuote(BOOTSTRAP_CODE) + tail + "; fi;",
+    "done;",
+    "exec python3 " + flags + " " + shellQuote(BOOTSTRAP_CODE) + tail,
+  ].join(" ");
+  return `/bin/sh -c ${shellQuote(script)}`;
+}
+
+function isMissingPythonError(error: unknown): boolean {
+  const msg = (error as Error)?.message ?? "";
+  return /exited 127\b|python3:.*not found|command not found.*python3|xcrun: error: invalid active developer path/i.test(msg);
 }
 
 export interface Probe { root: string; home: string; hostname: string; python: string; git: boolean; ripgrep: boolean }
 export interface RemoteContextFile { path: string; content: string }
 export interface DirectoryEntry { name: string; directory: boolean; symlink: boolean; escaped?: boolean }
-export interface RemoteFile { data: string; etag: string }
+export interface RemoteFile { data: string; etag: string; preview?: boolean; totalBytes?: number }
 export interface RemoteTextSlice {
   image: boolean;
   text?: string;
@@ -35,6 +56,11 @@ export interface TextOutput {
   matchLimitReached?: number | null;
   byteTruncated?: boolean;
   linesTruncated?: boolean;
+}
+export interface StreamChunkFrame {
+  id?: number;
+  stream: "stdout" | "stderr";
+  data: string;
 }
 export type Runner = (program: string, args: string[], options?: RunOptions) => Promise<RunResult>;
 
@@ -58,7 +84,11 @@ class PooledWorker {
   private exitCode: number | null = null;
   private exitSignal: NodeJS.Signals | null = null;
   private escalation: NodeJS.Timeout | undefined;
-  private waiter: { resolve: (line: string) => void; reject: (error: Error) => void } | undefined;
+  private waiter: {
+    resolve: (line: string) => void;
+    reject: (error: Error) => void;
+    onStream?: (frame: StreamChunkFrame) => void;
+  } | undefined;
 
   constructor(readonly host: string, readonly key: string, args: string[]) {
     this.child = spawn("ssh", args, { stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32", env: sshChildEnv() });
@@ -119,9 +149,21 @@ class PooledWorker {
       this.stdoutBuf = this.stdoutBuf.slice(nl + 1);
       const idx = line.indexOf(REMOTE_JSON_SENTINEL);
       if (idx < 0) continue;
+      const rawJson = line.slice(idx + REMOTE_JSON_SENTINEL.length);
+      if (this.waiter.onStream && rawJson.includes('"stream"')) {
+        try {
+          const parsed = JSON.parse(rawJson) as Partial<StreamChunkFrame> & { ok?: unknown };
+          if (typeof parsed.ok !== "boolean" && (parsed.stream === "stdout" || parsed.stream === "stderr") && typeof parsed.data === "string") {
+            this.waiter.onStream(parsed as StreamChunkFrame);
+            continue;
+          }
+        } catch {
+          // Fall through to normal response handler so malformed payloads fail cleanly.
+        }
+      }
       const pending = this.waiter;
       this.waiter = undefined;
-      pending.resolve(line.slice(idx + REMOTE_JSON_SENTINEL.length));
+      pending.resolve(rawJson);
     }
   }
 
@@ -137,7 +179,7 @@ class PooledWorker {
     if (this.escalation) { clearTimeout(this.escalation); this.escalation = undefined; }
   }
 
-  nextMessage<T>(timeoutMs: number, signal?: AbortSignal): Promise<T> {
+  nextMessage<T>(timeoutMs: number, signal?: AbortSignal, onStream?: (frame: StreamChunkFrame) => void): Promise<T> {
     if (signal?.aborted) {
       this.terminate();
       return Promise.reject(new ProcessAbortError(signal.reason));
@@ -160,6 +202,7 @@ class PooledWorker {
       };
       signal?.addEventListener("abort", onAbort, { once: true });
       this.waiter = {
+        onStream,
         resolve: payload => {
           cleanup();
           try { resolve(JSON.parse(payload) as T); }
@@ -228,6 +271,8 @@ export class RemotePool {
   private readonly workers = new Set<PooledWorker>();
   private readonly waitersByKey = new Map<string, Array<() => void>>();
   private readonly trackedConfigs = new Map<string, { signature: string; files: string[] }>();
+  private readonly hostOverridesCache = new Map<string, HostOptionOverrides>();
+  private readonly shFallbackHosts = new Set<string>();
   private nextRequestId = 0;
   private closed = false;
   private readonly idleTimeoutMs: number;
@@ -316,15 +361,25 @@ export class RemotePool {
     });
   }
 
-  private async computeKey(host: string, config: RemoteConfig): Promise<string> {
+  private async resolvePoolTarget(host: string, config: RemoteConfig, signal?: AbortSignal): Promise<{ key: string; overrides: HostOptionOverrides }> {
     const configKey = config.sshConfigPath ?? "";
     const previous = this.trackedConfigs.get(configKey);
     let sig = await sshConfigSignature(config, previous?.files);
     if (previous && sig.signature !== previous.signature) {
       sig = await sshConfigSignature(config);
+      this.hostOverridesCache.clear();
     }
     this.trackedConfigs.set(configKey, sig);
-    return `${host}\0${configKey}\0${config.connectTimeoutSeconds}\0${sig.signature}`;
+    const optionKey = `${host}\0${configKey}\0${sig.signature}`;
+    let overrides = this.hostOverridesCache.get(optionKey);
+    if (!overrides) {
+      overrides = await inspectHostOptionOverrides(host, config, signal).catch(() => ({}));
+      this.hostOverridesCache.set(optionKey, overrides);
+    }
+    return {
+      key: `${host}\0${configKey}\0${config.connectTimeoutSeconds}\0${sig.signature}`,
+      overrides,
+    };
   }
 
   private release(worker: PooledWorker) {
@@ -359,11 +414,18 @@ export class RemotePool {
     worker.idleTimer.unref();
   }
 
-  async rpc<T>(workspace: Workspace, config: RemoteConfig, op: string, params: Record<string, unknown> = {}, signal?: AbortSignal): Promise<T> {
+  async rpc<T>(
+    workspace: Workspace,
+    config: RemoteConfig,
+    op: string,
+    params: Record<string, unknown> = {},
+    signal?: AbortSignal,
+    callOptions: { timeoutMs?: number; onStream?: (frame: StreamChunkFrame) => void } = {},
+  ): Promise<T> {
     validateHost(workspace.host);
     if (this.closed) throw new Error("Remote connection pool is closed");
     if (signal?.aborted) throw new ProcessAbortError(signal.reason);
-    const key = await this.computeKey(workspace.host, config);
+    const { key, overrides } = await this.resolvePoolTarget(workspace.host, config, signal);
     for (const stale of [...this.workers]) {
       if (!stale.busy && stale.host === workspace.host && stale.key !== key) {
         stale.terminate();
@@ -371,8 +433,29 @@ export class RemotePool {
         this.notifyWaiters(stale.key);
       }
     }
-    const timeoutMs = config.commandTimeoutSeconds * 1000;
+    const timeoutMs = callOptions.timeoutMs ?? (config.commandTimeoutSeconds * 1000);
+    const timeoutSeconds = Math.max(1, Math.ceil(timeoutMs / 1000));
     const deadlineMs = Date.now() + timeoutMs;
+    const spawnWorkerWithHandshake = async (stepTimeoutMs: () => number, useShFallback: boolean): Promise<PooledWorker> => {
+      const pyCmd = useShFallback ? remoteFallbackShPythonCommand(true) : remotePythonCommand(true);
+      const args = [...sshArgs(config, overrides), "--", workspace.host, pyCmd];
+      const created = new PooledWorker(workspace.host, key, args);
+      this.workers.add(created);
+      void created.closed.then(() => {
+        this.workers.delete(created);
+        this.notifyWaiters(key);
+      });
+      try {
+        const handshake = await created.nextMessage<{ ready?: boolean }>(stepTimeoutMs(), signal);
+        if (!handshake?.ready) throw new Error("Invalid remote worker handshake");
+        return created;
+      } catch (error) {
+        created.terminate();
+        this.workers.delete(created);
+        this.notifyWaiters(key);
+        throw error;
+      }
+    };
     const executeOnce = async (allowReuse: boolean): Promise<{ value: T; reused: boolean }> => {
       let worker: PooledWorker | undefined;
       let reused = false;
@@ -413,27 +496,30 @@ export class RemotePool {
         worker.busy = true;
         worker.ref();
       } else {
-        const args = [...sshArgs(config), "--", workspace.host, remotePythonCommand(true)];
-        worker = new PooledWorker(workspace.host, key, args);
-        this.workers.add(worker);
-        void worker.closed.then(() => {
-          this.workers.delete(worker!);
-          this.notifyWaiters(key);
-        });
+        const preferFallback = this.shFallbackHosts.has(workspace.host);
         try {
-          const handshake = await worker.nextMessage<{ ready?: boolean }>(stepTimeoutMs(), signal);
-          if (!handshake?.ready) throw new Error("Invalid remote worker handshake");
+          worker = await spawnWorkerWithHandshake(stepTimeoutMs, preferFallback);
         } catch (error) {
-          worker.terminate();
-          this.workers.delete(worker);
-          this.notifyWaiters(key);
-          throw error;
+          if (!preferFallback && !signal?.aborted && isMissingPythonError(error)) {
+            worker = await spawnWorkerWithHandshake(stepTimeoutMs, true);
+            this.shFallbackHosts.add(workspace.host);
+          } else {
+            throw error;
+          }
         }
       }
       const id = ++this.nextRequestId;
+      let receivedStreamData = false;
+      const handleStream = callOptions.onStream
+        ? (frame: StreamChunkFrame) => {
+            if (frame.id !== undefined && frame.id !== id) return;
+            receivedStreamData = true;
+            callOptions.onStream!(frame);
+          }
+        : undefined;
       try {
-        worker.send({ ...params, root: workspace.path, timeout: config.commandTimeoutSeconds, op, id });
-        const response = await worker.nextMessage<{ id?: number; ok: boolean; value: T; error?: string }>(stepTimeoutMs(), signal);
+        worker.send({ ...params, root: workspace.path, timeout: timeoutSeconds, op, id });
+        const response = await worker.nextMessage<{ id?: number; ok: boolean; value: T; error?: string }>(stepTimeoutMs(), signal, handleStream);
         if (response.id !== id) {
           worker.terminate();
           this.workers.delete(worker);
@@ -452,14 +538,17 @@ export class RemotePool {
           this.workers.delete(worker);
           this.notifyWaiters(key);
         }
-        throw Object.assign(error as Error, { _reusedWorkerDead: reused && worker.dead });
+        throw Object.assign(error as Error, { _reusedWorkerDead: reused && worker.dead && !receivedStreamData });
       }
     };
 
     try {
       return (await executeOnce(true)).value;
     } catch (error) {
-      const canRetry = (error as { _reusedWorkerDead?: boolean })._reusedWorkerDead && !signal?.aborted && !(error instanceof ProcessTimeoutError) && (op !== "write" || params.etag !== undefined);
+      // Non-idempotent operations (`bash`, `rename`, `delete`, or create-only `write` with `etag === null`)
+      // only skip retry when side effects might have partially run; idempotent reads and overwrites retry cleanly.
+      const idempotentOp = op !== "bash" && op !== "rename" && op !== "delete" && !(op === "write" && params.etag === null);
+      const canRetry = (error as { _reusedWorkerDead?: boolean })._reusedWorkerDead && !signal?.aborted && !(error instanceof ProcessTimeoutError) && idempotentOp;
       if (!canRetry) throw error;
       return (await executeOnce(false)).value;
     }
@@ -496,41 +585,143 @@ export class RemoteClient {
   ) {
     validateHost(workspace.host);
   }
+  private async runOneShot<T>(
+    op: string,
+    params: Record<string, unknown>,
+    options: { signal?: AbortSignal; timeoutMs?: number; onStream?: (frame: StreamChunkFrame) => void } = {},
+  ): Promise<T> {
+    const timeoutMs = options.timeoutMs ?? (this.config.commandTimeoutSeconds * 1000);
+    const timeoutSeconds = Math.max(1, Math.ceil(timeoutMs / 1000));
+    const overrides = this.runner === runProcess
+      ? await inspectHostOptionOverrides(this.workspace.host, this.config, options.signal).catch(() => ({}))
+      : undefined;
+    const invokeWithCommand = async (pyCmd: string): Promise<T> => {
+      let lineBuf = "";
+      let finalPayload: { ok: boolean; value: T; error?: string } | undefined;
+      const parseLine = (rawLine: string) => {
+        const idx = rawLine.indexOf(REMOTE_JSON_SENTINEL);
+        if (idx < 0) return;
+        const jsonPart = rawLine.slice(idx + REMOTE_JSON_SENTINEL.length);
+        const parsed = JSON.parse(jsonPart) as Partial<StreamChunkFrame> & { ok?: boolean; value?: T; error?: string };
+        if (typeof parsed.ok === "boolean") {
+          finalPayload = parsed as { ok: boolean; value: T; error?: string };
+        } else if (options.onStream && (parsed.stream === "stdout" || parsed.stream === "stderr") && typeof parsed.data === "string") {
+          options.onStream(parsed as StreamChunkFrame);
+        }
+      };
+      const result = await this.runner("ssh", [...sshArgs(this.config, overrides), "--", this.workspace.host, pyCmd], {
+        input: JSON.stringify({ ...params, root: this.workspace.path, timeout: timeoutSeconds, op }),
+        signal: options.signal,
+        timeoutMs,
+        ...(options.onStream ? {
+          collect: false,
+          onStdout: chunk => {
+            lineBuf += chunk.toString("utf8");
+            while (true) {
+              const nl = lineBuf.indexOf("\n");
+              if (nl < 0) break;
+              const line = lineBuf.slice(0, nl).replace(/\r$/, "");
+              lineBuf = lineBuf.slice(nl + 1);
+              try { parseLine(line); } catch { /* Handled on completion below. */ }
+            }
+          },
+        } : {}),
+      });
+      if (result.exitCode !== 0) {
+        throw new Error(`SSH ${this.workspace.host} exited ${result.exitCode}: ${result.stderr.toString().trim() || result.stdout.toString().trim()}`);
+      }
+      if (!finalPayload) {
+        try {
+          if (lineBuf.trim()) parseLine(lineBuf.trim());
+          finalPayload ??= parseRemoteJson<{ ok: boolean; value: T; error?: string }>(result.stdout.toString());
+        } catch {
+          throw new Error("Invalid remote response. Ensure Python 3 is installed and SSH startup scripts do not print to stdout.");
+        }
+      }
+      if (!finalPayload.ok) throw new Error(finalPayload.error || "Remote operation failed");
+      return finalPayload.value;
+    };
+    try {
+      return await invokeWithCommand(remotePythonCommand(false));
+    } catch (error) {
+      if (this.runner === runProcess && !options.signal?.aborted && isMissingPythonError(error)) {
+        return invokeWithCommand(remoteFallbackShPythonCommand(false));
+      }
+      throw error;
+    }
+  }
   async rpc<T>(op: string, params: Record<string, unknown> = {}, signal?: AbortSignal): Promise<T> {
     if (this.pool && this.runner === runProcess) {
       return this.pool.rpc<T>(this.workspace, this.config, op, params, signal);
     }
-    const result = await this.runner("ssh", [...sshArgs(this.config), "--", this.workspace.host, remotePythonCommand(false)], {
-      input: JSON.stringify({ ...params, root: this.workspace.path, timeout: this.config.commandTimeoutSeconds, op }), signal,
-      timeoutMs: this.config.commandTimeoutSeconds * 1000,
-    });
-    if (result.exitCode !== 0) throw new Error(`SSH ${this.workspace.host} exited ${result.exitCode}: ${result.stderr.toString().trim() || result.stdout.toString().trim()}`);
-    let response: { ok: boolean; value: T; error?: string };
-    try { response = parseRemoteJson(result.stdout.toString()); }
-    catch { throw new Error("Invalid remote response. Ensure Python 3 is installed and SSH startup scripts do not print to stdout."); }
-    if (!response.ok) throw new Error(response.error || "Remote operation failed");
-    return response.value;
+    return this.runOneShot<T>(op, params, { signal });
   }
   probe(signal?: AbortSignal) { return this.rpc<Probe>("probe", {}, signal); }
   context(signal?: AbortSignal) { return this.rpc<RemoteContextFile[]>("context", {}, signal); }
   list(path = ".", signal?: AbortSignal) { return this.rpc<DirectoryEntry[]>("list", { path }, signal); }
-  read(path: string, signal?: AbortSignal) { return this.rpc<RemoteFile>("read", { path }, signal); }
+  read(path: string, signal?: AbortSignal, options?: { maxEditableBytes?: number; previewBytes?: number }) {
+    return this.rpc<RemoteFile>("read", { path, ...options }, signal);
+  }
   readLines(path: string, options: { offset?: number; limit?: number; maxBytes?: number } = {}, signal?: AbortSignal) {
     return this.rpc<RemoteTextSlice>("read_lines", { path, ...options }, signal);
   }
   write(path: string, content: Buffer | string, etag?: string | null, signal?: AbortSignal) {
     return this.rpc<{ etag: string }>("write", { path, data: Buffer.from(content).toString("base64"), ...(etag !== undefined ? { etag } : {}) }, signal);
   }
+  mkdir(path: string, signal?: AbortSignal) {
+    return this.rpc<boolean>("mkdir", { path }, signal);
+  }
+  rename(path: string, newPath: string, signal?: AbortSignal) {
+    return this.rpc<boolean>("rename", { path, newPath }, signal);
+  }
+  remove(path: string, options: { recursive?: boolean } = {}, signal?: AbortSignal) {
+    return this.rpc<boolean>("delete", { path, ...options }, signal);
+  }
   async bash(command: string, cwd = this.workspace.path, options: RunOptions = {}): Promise<RunResult> {
-    // Expand ~/ using the remote shell's HOME, never the local user's home.
-    const remoteCwd = cwd === "~" ? '"$HOME"' : cwd.startsWith("~/") ? `"$HOME"/${shellQuote(cwd.slice(2))}` : shellQuote(cwd);
-    const script = `cd -- ${remoteCwd} || exit $?\n${command}`;
-    const result = await this.runner("ssh", [...sshArgs(this.config), "--", this.workspace.host, `exec bash -lc ${shellQuote(script)}`], {
-      timeoutMs: this.config.commandTimeoutSeconds * 1000, ...options,
-    });
-    if (result.exitCode === 255) {
-      throw new Error(`SSH connection failed: ${result.stderr.toString().trim() || "SSH exited with status 255"}`);
+    const timeoutMs = options.timeoutMs ?? (this.config.commandTimeoutSeconds * 1000);
+    const maxBytes = options.maxBytes ?? 24 * 1024 * 1024;
+    const collect = options.collect !== false;
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let collectedBytes = 0;
+    const localAbort = new AbortController();
+    const onParentAbort = () => localAbort.abort(options.signal?.reason);
+    options.signal?.addEventListener("abort", onParentAbort, { once: true });
+    if (options.signal?.aborted) localAbort.abort(options.signal.reason);
+    let sizeExceeded = false;
+
+    const onStream = (frame: StreamChunkFrame) => {
+      const buf = Buffer.from(frame.data, "base64");
+      options.onData?.(buf);
+      if (collect) {
+        collectedBytes += buf.length;
+        if (collectedBytes > maxBytes) {
+          sizeExceeded = true;
+          localAbort.abort();
+          return;
+        }
+        if (frame.stream === "stderr") stderrChunks.push(buf);
+        else stdoutChunks.push(buf);
+      }
+    };
+
+    try {
+      const outcome = this.pool && this.runner === runProcess
+        ? await this.pool.rpc<{ exitCode: number }>(this.workspace, this.config, "bash", { command, cwd }, localAbort.signal, { timeoutMs, onStream })
+        : await this.runOneShot<{ exitCode: number }>("bash", { command, cwd }, { signal: localAbort.signal, timeoutMs, onStream });
+      return {
+        stdout: collect ? Buffer.concat(stdoutChunks) : Buffer.alloc(0),
+        stderr: collect ? Buffer.concat(stderrChunks) : Buffer.alloc(0),
+        exitCode: outcome.exitCode ?? 0,
+      };
+    } catch (error) {
+      if (sizeExceeded) throw new Error("Process output exceeds size limit");
+      if ((error as Error)?.message && /exited 255\b/.test((error as Error).message)) {
+        throw new Error(`SSH connection failed: ${(error as Error).message}`);
+      }
+      throw error;
+    } finally {
+      options.signal?.removeEventListener("abort", onParentAbort);
     }
-    return result;
   }
 }

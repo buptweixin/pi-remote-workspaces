@@ -36,6 +36,8 @@ jobs:
         run: npm install --global npm@11
       - name: Check tag and registry version
         id: release
+        env:
+          RELEASE_NOTES_FILE: ${{ runner.temp }}/pi-remote-release-notes.md
         run: node scripts/release-info.mjs
       - run: npm ci
       - run: npm run check
@@ -59,5 +61,5 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" "$RUNNER_TEMP"/pi-remote-release/*.tgz "$RUNNER_TEMP"/pi-remote-release/*.piplug --verify-tag --title "$RELEASE_TAG" --notes-file CHANGELOG.md
+            gh release create "$RELEASE_TAG" "$RUNNER_TEMP"/pi-remote-release/*.tgz "$RUNNER_TEMP"/pi-remote-release/*.piplug --verify-tag --title "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/pi-remote-release-notes.md"
           fi

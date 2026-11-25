@@ -5,7 +5,8 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { ConfigStore, defaults, slugifyWorkspaceId, validateConfig, validateHost } from "../src/config.js";
 import { anchorRootDir, matchAnchorCwd, removeWorkspaceAnchorIfEmpty, syncWorkspaceAnchors, workspaceAnchorDir } from "../src/anchors.js";
-import { discoverHosts, resolveHost, tokens } from "../src/ssh-config.js";
+import { discoverHosts, inspectHostOptionOverrides, resolveHost, sshArgs, tokens } from "../src/ssh-config.js";
+import { extractReleaseNotes } from "../scripts/release-info.mjs";
 import { temporary, workspace } from "./helpers.js";
 
 test("SSH discovery reloads nested Includes, quotes, multi-alias Host lines and cycles", async t => {
@@ -120,4 +121,56 @@ test("anchorRoot validation, directory defaults, sync, safe removal and cwd matc
   await writeFile(join(synced.workspaces["demo-ws"]!, "keep.txt"), "data");
   await removeWorkspaceAnchorIfEmpty("demo-ws", cfg, customStoreFile);
   assert.ok((await stat(join(synced.workspaces["demo-ws"]!, "keep.txt"))).isFile());
+});
+
+test("ConfigStore defensive caching, SSH host option precedence, and release notes extraction", async t => {
+  const dir = await temporary(t);
+  const store = new ConfigStore(join(dir, "remote.json"));
+  await store.update(cfg => ({ ...cfg, workspaces: [{ ...workspace("/srv/a"), id: "a" }] }));
+  const firstRead = await store.read();
+  firstRead.workspaces.push({ ...workspace("/srv/mutated"), id: "mutated" });
+  const secondRead = await store.read();
+  assert.equal(secondRead.workspaces.length, 1, "cached ConfigStore.read() must return defensive clones");
+
+  const sshCfg = join(dir, "ssh_config");
+  await writeFile(sshCfg, [
+    "Host ephemeral",
+    "  HostName 127.0.0.1",
+    "  StrictHostKeyChecking accept-new",
+    "  ConnectTimeout 42",
+    "  ServerAliveInterval 30",
+    "Host standard",
+    "  HostName 127.0.0.1",
+  ].join("\n"));
+  const cfg = { ...defaults(), sshConfigPath: sshCfg };
+  const ephOverrides = await inspectHostOptionOverrides("ephemeral", cfg);
+  assert.equal(ephOverrides.hasExplicitStrictHostKeyChecking, true);
+  assert.equal(ephOverrides.hasExplicitConnectTimeout, true);
+  assert.equal(ephOverrides.hasExplicitServerAliveInterval, true);
+  const ephArgs = sshArgs(cfg, ephOverrides);
+  assert.equal(ephArgs.includes("StrictHostKeyChecking=yes"), false);
+  assert.equal(ephArgs.some(a => a.startsWith("ConnectTimeout=")), false);
+
+  const stdOverrides = await inspectHostOptionOverrides("standard", cfg);
+  assert.equal(stdOverrides.hasExplicitStrictHostKeyChecking, false);
+  const stdArgs = sshArgs(cfg, stdOverrides);
+  assert.equal(stdArgs.includes("StrictHostKeyChecking=yes"), true);
+  assert.equal(stdArgs.includes("ConnectTimeout=10"), true);
+
+  const sampleChangelog = [
+    "# Changelog",
+    "",
+    "## 0.6.0 - 2026-11-25",
+    "",
+    "- First improvement",
+    "- Second improvement",
+    "",
+    "## 0.5.0 - 2026-11-20",
+    "",
+    "- Older entry",
+  ].join("\n");
+  const notes = extractReleaseNotes(sampleChangelog, "0.6.0");
+  assert.match(notes, /^## 0\.6\.0 - 2026-11-25/);
+  assert.match(notes, /First improvement/);
+  assert.doesNotMatch(notes, /0\.5\.0/);
 });

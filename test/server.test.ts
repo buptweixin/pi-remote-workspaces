@@ -26,6 +26,9 @@ test("dashboard protects its API and completes workspace/file configuration flow
   assert.equal(await withHost("127.0.0.1:30142", "http://127.0.0.1:30142"), 200);
   const html = await fetch(url.origin); assert.match(html.headers.get("content-security-policy")!, /frame-ancestors 'none'/);
   assert.match(await html.text(), /Pi Remote/);
+  const sharedJs = await fetch(`${url.origin}/workbench-core.js`);
+  assert.equal(sharedJs.status, 200);
+  assert.match(await sharedJs.text(), /PiRemoteWorkbenchCore/);
   const initialState = await (await request("/api/state", "GET")).json();
   assert.equal(initialState.anchors.root, anchorRootDir(initialState.config, store.file));
   assert.ok((await stat(initialState.anchors.root)).isDirectory());
@@ -53,8 +56,22 @@ test("dashboard protects its API and completes workspace/file configuration flow
   response = await request("/api/config", "PUT", { connectTimeoutSeconds: 20, commandTimeoutSeconds: 180, anchorRoot: customAnchorRoot });
   assert.equal(response.status, 200); assert.equal((await store.read()).workspaces.length, 1);
   assert.ok((await stat(workspaceAnchorDir("demo", { anchorRoot: customAnchorRoot }, store.file))).isDirectory());
+  // PATCH /api/config preserves omitted optional fields like anchorRoot.
+  response = await request("/api/config", "PATCH", { commandTimeoutSeconds: 240 });
+  assert.equal(response.status, 200);
+  assert.equal((await store.read()).anchorRoot, customAnchorRoot);
   response = await request("/api/config", "PUT", { connectTimeoutSeconds: 20, commandTimeoutSeconds: 180 });
   assert.equal(response.status, 200);
+  // mkdir / rename / delete endpoints and >8 MiB preview-capped read.
+  assert.equal((await request("/api/workspaces/demo/mkdir", "POST", { path: "sub/dir" })).status, 200);
+  assert.equal((await request("/api/workspaces/demo/write", "POST", { path: "sub/dir/a.txt", content: "v1", etag: null })).status, 200);
+  assert.equal((await request("/api/workspaces/demo/rename", "POST", { path: "sub/dir/a.txt", newPath: "sub/dir/b.txt" })).status, 200);
+  assert.equal((await request("/api/workspaces/demo/delete", "POST", { path: "sub", recursive: true })).status, 200);
+  await writeFile(join(root, "giant-preview.log"), Buffer.alloc(9 * 1024 * 1024, 0x41));
+  const previewRead = await (await request("/api/workspaces/demo/read", "POST", { path: "giant-preview.log", maxEditableBytes: 524288, previewBytes: 16384 })).json();
+  assert.equal(previewRead.preview, true);
+  assert.equal(previewRead.totalBytes, 9 * 1024 * 1024);
+  assert.equal(Buffer.from(previewRead.data, "base64").length, 16384);
   // Create-only write (etag: null) succeeds for new files and rejects existing files.
   response = await request("/api/workspaces/demo/write", "POST", { path: "brand-new.txt", content: "created", etag: null });
   assert.equal(response.status, 200);

@@ -17,7 +17,7 @@ function readRuntimeVersion(): string {
       if (typeof parsed.version === "string" && parsed.version) return parsed.version;
     } catch { /* Try next candidate. */ }
   }
-  return "0.5.0";
+  return "0.6.0";
 }
 
 const packageVersion = readRuntimeVersion();
@@ -95,15 +95,16 @@ export class DashboardController {
         const anchors = await syncWorkspaceAnchors(config, this.store.file);
         return { status: 200, body: { version: packageVersion, config, inventory: await discoverHosts(config), configFile: this.store.file, anchors } };
       }
-      if (pathname === "/api/config" && method === "PUT") {
+      if (pathname === "/api/config" && (method === "PUT" || method === "PATCH")) {
+        const isPatch = method === "PATCH";
         const sshConfigPath = typeof input.sshConfigPath === "string" ? input.sshConfigPath.trim() : input.sshConfigPath;
         const anchorRoot = typeof input.anchorRoot === "string" ? input.anchorRoot.trim() : input.anchorRoot;
         const next = await this.store.update(current => validateConfig({
           ...current,
-          sshConfigPath: sshConfigPath || undefined,
-          anchorRoot: anchorRoot || undefined,
-          connectTimeoutSeconds: input.connectTimeoutSeconds,
-          commandTimeoutSeconds: input.commandTimeoutSeconds,
+          sshConfigPath: isPatch && !("sshConfigPath" in input) ? current.sshConfigPath : (sshConfigPath || undefined),
+          anchorRoot: isPatch && !("anchorRoot" in input) ? current.anchorRoot : (anchorRoot || undefined),
+          connectTimeoutSeconds: isPatch && input.connectTimeoutSeconds === undefined ? current.connectTimeoutSeconds : input.connectTimeoutSeconds,
+          commandTimeoutSeconds: isPatch && input.commandTimeoutSeconds === undefined ? current.commandTimeoutSeconds : input.commandTimeoutSeconds,
         }));
         await this.pool.closeHost();
         await syncWorkspaceAnchors(next, this.store.file).catch(() => {});
@@ -130,7 +131,7 @@ export class DashboardController {
         // Do not expose unrelated environment/proxy command content in the dashboard.
         return { status: 200, body: Object.fromEntries(["hostname", "user", "port", "identityfile", "proxyjump"].map(key => [key, resolved[key]])) };
       }
-      const match = /^\/api\/workspaces\/([a-zA-Z0-9_-]+)(?:\/(probe|list|read|write|search|git|exec))?$/.exec(pathname);
+      const match = /^\/api\/workspaces\/([a-zA-Z0-9_-]+)(?:\/(probe|list|read|write|mkdir|rename|delete|search|git|exec))?$/.exec(pathname);
       if (!match) return { status: 404, body: { error: "Unknown endpoint" } };
       const workspace = config.workspaces.find(w => w.id === match[1]);
       if (!workspace) return { status: 404, body: { error: "Workspace not found" } };
@@ -161,10 +162,35 @@ export class DashboardController {
       switch (match[2]) {
         case "probe": result = await client.probe(signal); break;
         case "list": result = await client.list(requiredString(input.path ?? ".", "path"), signal); break;
-        case "read": result = await client.read(requiredString(input.path, "path"), signal); break;
+        case "read": {
+          const readOpts: { maxEditableBytes?: number; previewBytes?: number } = {};
+          if (typeof input.maxEditableBytes === "number" && Number.isFinite(input.maxEditableBytes) && input.maxEditableBytes > 0) {
+            readOpts.maxEditableBytes = Math.floor(input.maxEditableBytes);
+          }
+          if (typeof input.previewBytes === "number" && Number.isFinite(input.previewBytes) && input.previewBytes > 0) {
+            readOpts.previewBytes = Math.floor(input.previewBytes);
+          }
+          result = await client.read(requiredString(input.path, "path"), signal, readOpts);
+          break;
+        }
         case "write": {
-          const etag = input.etag === null ? null : requiredString(input.etag, "etag");
+          const etag = input.etag === null ? null : input.etag === undefined ? undefined : requiredString(input.etag, "etag");
           result = await client.write(requiredString(input.path, "path"), requiredString(input.content, "content"), etag, signal);
+          break;
+        }
+        case "mkdir": {
+          await client.mkdir(requiredString(input.path, "path"), signal);
+          result = { ok: true };
+          break;
+        }
+        case "rename": {
+          await client.rename(requiredString(input.path, "path"), requiredString(input.newPath, "newPath"), signal);
+          result = { ok: true };
+          break;
+        }
+        case "delete": {
+          await client.remove(requiredString(input.path, "path"), { recursive: input.recursive === true }, signal);
+          result = { ok: true };
           break;
         }
         case "search": {
@@ -178,7 +204,12 @@ export class DashboardController {
           result = await client.rpc(input.mode === "find" ? "find" : "grep", searchParams, signal);
           break;
         }
-        case "git": result = await client.rpc("git", { action: input.action }, signal); break;
+        case "git": {
+          const gitParams: Record<string, unknown> = { action: input.action };
+          if (typeof input.path === "string" && input.path.trim()) gitParams.path = input.path.trim();
+          result = await client.rpc("git", gitParams, signal);
+          break;
+        }
         case "exec": {
           const chunks: Buffer[] = [];
           let totalBytes = 0;

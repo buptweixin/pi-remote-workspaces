@@ -9,4 +9,4 @@ export interface BuildPiDesktopResult {
 
 export function crc32(data: Uint8Array): number;
 export function buildStoreZip(entries: Array<{ name: string; data: Uint8Array }>): Buffer;
-export function buildPiDesktopPlugin(options?: { projectDir?: string; outDir?: string }): Promise<BuildPiDesktopResult>;
+export function buildPiDesktopPlugin(options?: { projectDir?: string; outDir?: string; skipCompile?: boolean }): Promise<BuildPiDesktopResult>;

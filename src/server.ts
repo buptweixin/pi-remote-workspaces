@@ -43,6 +43,7 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Da
     const assets: Record<string, [string, string]> = {
       "/": ["index.html", "text/html"],
       "/index.html": ["index.html", "text/html"],
+      "/workbench-core.js": ["workbench-core.js", "text/javascript"],
       "/app.js": ["app.js", "text/javascript"],
       "/style.css": ["style.css", "text/css"],
       "/favicon.svg": ["favicon.svg", "image/svg+xml"],

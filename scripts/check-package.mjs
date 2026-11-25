@@ -32,7 +32,7 @@ try {
   const packed = run("npm", ["pack", "--json", "--pack-destination", output]);
   const [archive] = JSON.parse(packed.slice(packed.indexOf("[")));
   const files = new Set(archive.files.map(file => file.path));
-  for (const file of ["src/extension.ts", "dist/cli.js", "public/index.html", "public/app.js", "public/style.css", "public/favicon.svg", "README.md", "README.zh-CN.md", "CHANGELOG.md", "LICENSE", "THIRD_PARTY_NOTICES.md"]) {
+  for (const file of ["src/extension.ts", "dist/cli.js", "public/index.html", "public/workbench-core.js", "public/app.js", "public/style.css", "public/favicon.svg", "README.md", "README.zh-CN.md", "CHANGELOG.md", "LICENSE", "THIRD_PARTY_NOTICES.md"]) {
     assert.ok(files.has(file), `Missing package file: ${file}`);
   }
   assert.ok(![...files].some(file => /(^|\/)(node_modules|\.git|\.env|\.npmrc)(\/|$)/.test(file)), "Unexpected private or dependency files in package");

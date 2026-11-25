@@ -6,6 +6,7 @@
   <meta name="pi-plugin-chrome" content="v2">
   <title>SSH 远程工作区</title>
   <link rel="stylesheet" href="./workbench.css">
+  <script src="./workbench-core.js" defer></script>
   <script src="./workbench.js" defer></script>
 </head>
 <body>
@@ -53,6 +54,7 @@
           <div class="wb-tree-bar">
             <button id="up-dir" class="wb-icon-btn" type="button" title="上级目录" disabled>↑</button>
             <code id="dir-label" class="wb-path">/</code>
+            <button id="new-folder" class="wb-icon-btn" type="button" title="新建文件夹">⊞</button>
             <button id="new-file" class="wb-icon-btn" type="button" title="新建文件">＋</button>
             <button id="refresh-dir" class="wb-icon-btn" type="button" title="刷新目录">↻</button>
           </div>
@@ -62,6 +64,8 @@
           <div class="wb-editor-bar">
             <code id="editor-path" class="wb-path">选择左侧文件查看或编辑</code>
             <span id="editor-dirty" class="wb-dirty" hidden>● 未保存</span>
+            <button id="rename-file" class="wb-btn" type="button" disabled>重命名</button>
+            <button id="delete-file" class="wb-btn wb-danger" type="button" disabled>删除</button>
             <button id="reload-file" class="wb-btn" type="button" disabled>重读</button>
             <button id="save-file" class="wb-primary-btn" type="button" disabled>保存</button>
           </div>
@@ -88,6 +92,7 @@
       <section id="tab-search" class="wb-pane wb-col-pane" hidden>
         <form id="search-form" class="wb-search-bar">
           <input id="search-input" class="wb-input" placeholder="搜索内容或文件名 Glob（如 *.ts）" required>
+          <input id="search-glob" class="wb-input wb-glob-input" placeholder="过滤如 *.ts">
           <select id="search-mode" class="wb-select wb-select-compact">
             <option value="grep">内容</option>
             <option value="find">文件名</option>
@@ -153,6 +158,10 @@
         <label class="wb-field">
           <span>自定义 SSH 配置文件（可选）</span>
           <input name="sshConfigPath" class="wb-input wb-mono" placeholder="留空使用默认 ~/.ssh/config">
+        </label>
+        <label class="wb-field">
+          <span>pi-web 锚点根目录（可选）</span>
+          <input name="anchorRoot" class="wb-input wb-mono" placeholder="留空使用默认 ~/.pi/remote-workspaces">
         </label>
         <div class="wb-row-2">
           <label class="wb-field">

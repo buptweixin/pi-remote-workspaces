@@ -54,7 +54,7 @@ const RUNTIME_FILES = [
   "pi-web.js",
   "extension.js",
 ];
-const PUBLIC_VIEW_FILES = ["index.html", "app.js", "style.css", "favicon.svg"];
+const PUBLIC_VIEW_FILES = ["index.html", "workbench-core.js", "app.js", "style.css", "favicon.svg"];
 const DESKTOP_WORKBENCH_FILES = ["workbench.html", "workbench.css", "workbench.js"];
 
 const CRC_TABLE = (() => {
@@ -162,8 +162,11 @@ async function walkDirectory(rootDir, relPrefix = "") {
 export async function buildPiDesktopPlugin({
   projectDir = process.cwd(),
   outDir = resolve(projectDir, "release-artifacts"),
+  skipCompile = false,
 } = {}) {
-  if (!existsSync(join(projectDir, "dist/pi-desktop-main.js"))) {
+  const missingDist = !existsSync(join(projectDir, "dist/pi-desktop-main.js"))
+    || RUNTIME_FILES.some(file => !existsSync(join(projectDir, "dist", file)));
+  if (!skipCompile || missingDist) {
     const tscBin = join(projectDir, "node_modules/typescript/bin/tsc");
     const compile = spawnSync(process.execPath, [tscBin, "-p", "tsconfig.build.json"], { cwd: projectDir, encoding: "utf8" });
     if (compile.error || compile.status !== 0) {
@@ -282,11 +285,13 @@ export async function buildPiDesktopPlugin({
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const args = process.argv.slice(2);
+  const rawArgs = process.argv.slice(2);
+  const skipCompile = rawArgs.includes("--skip-compile");
+  const args = rawArgs.filter(arg => arg !== "--skip-compile");
   if (args.length && (args.length !== 2 || args[0] !== "--output-dir")) {
-    throw new Error("Usage: node scripts/build-pi-desktop.mjs [--output-dir directory]");
+    throw new Error("Usage: node scripts/build-pi-desktop.mjs [--skip-compile] [--output-dir directory]");
   }
   const outDir = args[1] ? resolve(args[1]) : undefined;
-  const result = await buildPiDesktopPlugin({ outDir });
+  const result = await buildPiDesktopPlugin({ outDir, skipCompile });
   console.log(JSON.stringify(result, null, 2));
 }

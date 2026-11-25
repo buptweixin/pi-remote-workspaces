@@ -42,6 +42,8 @@ function isNativePiRuntime(pi: ExtensionAPI): boolean {
   return hasNativeToolFactories() && !keys.includes("registerAgent") && keys.includes("getSettings");
 }
 
+const CONTEXT_BASENAMES = new Set(["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]);
+
 /** Each factory owns one session; never share an active host through module globals. */
 export default function remoteExtension(pi: ExtensionAPI) {
   const nativeMode = isNativePiRuntime(pi);
@@ -55,6 +57,12 @@ export default function remoteExtension(pi: ExtensionAPI) {
   let flagApplied = false;
   const liveness = new PiWebLivenessLease("pi-remote", () => Boolean(dashboard) || activeInteractiveOps > 0);
   pi.registerFlag("remote", { description: "Bind this session to a saved remote workspace ID", type: "string" });
+
+  const maybeInvalidateContextPath = (mutatedPath: string) => {
+    const clean = mutatedPath.replace(/\\/g, "/").replace(/\/+$/, "");
+    const leaf = clean.includes("/") ? clean.slice(clean.lastIndexOf("/") + 1) : clean;
+    if (CONTEXT_BASENAMES.has(leaf)) remoteContextCache = undefined;
+  };
 
   const unavailableMessage = (error: string) => `Remote workspace unavailable: ${error}. Use /remote use <id> or /remote local.`;
   const sessionIdOf = (ctx: ExtensionContext): string => {
@@ -117,11 +125,11 @@ export default function remoteExtension(pi: ExtensionAPI) {
     // Only replace the previous binding after the new workspace is verified.
     const client = new RemoteClient(workspace, config, undefined, pool);
     const probe = await client.probe();
-    const contextFiles = await client.context().catch(() => []);
+    const contextFiles = await client.context().then(files => ({ ok: true as const, files })).catch(() => ({ ok: false as const, files: [] as RemoteContextFile[] }));
     if (state.mode === "remote" && state.binding.workspace.host !== workspace.host) {
       await pool.closeHost(state.binding.workspace.host);
     }
-    remoteContextCache = { key: `${workspace.host}:${probe.root}`, files: contextFiles };
+    remoteContextCache = contextFiles.ok ? { key: `${workspace.host}:${probe.root}`, files: contextFiles.files } : undefined;
     state = { mode: "remote", binding: { workspace: { ...workspace, path: probe.root }, probe } };
     await persist(ctx);
     ctx.ui.notify(`已绑定 ${workspace.name}: ${workspace.host}:${probe.root}`, "info");
@@ -160,7 +168,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
           if (state.mode === "local") return (factory(ctx.cwd) as ToolDefinition<any, any>).execute(id, params, signal, onUpdate, ctx);
           const binding = state.binding;
           const client = new RemoteClient(binding.workspace, await store.read(), undefined, pool);
-          const tool = createRemoteTools(client, binding.probe, signal)[local.name]!;
+          const tool = createRemoteTools(client, binding.probe, signal, maybeInvalidateContextPath)[local.name]!;
           return tool.execute(id, params, signal, onUpdate, ctx);
         },
       });
@@ -195,7 +203,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
           }
           const binding = state.binding;
           const client = new RemoteClient(binding.workspace, await store.read(), undefined, pool);
-          const tool = createStandaloneRemoteTools(client, binding.probe, signal)[name];
+          const tool = createStandaloneRemoteTools(client, binding.probe, signal, maybeInvalidateContextPath)[name];
           return tool.execute(id, params, signal, onUpdate, ctx);
         },
       });
@@ -270,15 +278,15 @@ export default function remoteExtension(pi: ExtensionAPI) {
     if (!nativeMode) await restore(ctx);
     const loadRemoteContext = async (host: string, root: string, workspace: Binding["workspace"]) => {
       const cacheKey = `${host}:${root}`;
-      if (remoteContextCache?.key !== cacheKey) {
-        try {
-          const files = await new RemoteClient(workspace, await store.read(), undefined, pool).context();
-          remoteContextCache = { key: cacheKey, files };
-        } catch {
-          remoteContextCache = { key: cacheKey, files: [] };
-        }
+      if (remoteContextCache?.key === cacheKey) return remoteContextCache.files;
+      try {
+        const files = await new RemoteClient(workspace, await store.read(), undefined, pool).context();
+        remoteContextCache = { key: cacheKey, files };
+        return files;
+      } catch {
+        // Do not poison cache on transient connection hiccups; retry on a later turn.
+        return [];
       }
-      return remoteContextCache.files;
     };
 
     if (!nativeMode) {
@@ -518,6 +526,7 @@ export default function remoteExtension(pi: ExtensionAPI) {
     if (state.mode === "blocked") throw new Error(state.error);
     if (state.mode === "local") { ctx.ui.notify("当前会话使用本地工具", "info"); return; }
     const probe = await new RemoteClient(state.binding.workspace, await store.read(), undefined, pool).probe();
+    remoteContextCache = undefined;
     state = { mode: "remote", binding: { workspace: { ...state.binding.workspace, path: probe.root }, probe } };
     await persist(ctx);
     ctx.ui.notify(`${state.binding.workspace.host}:${probe.root} · ${probe.hostname} · Python ${probe.python} · git ${probe.git ? "✓" : "×"} · rg ${probe.ripgrep ? "✓" : "×"}`, "info");

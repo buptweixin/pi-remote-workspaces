@@ -6,6 +6,7 @@ export interface RunOptions {
   timeoutMs?: number;
   maxBytes?: number;
   onData?: (data: Buffer) => void;
+  onStdout?: (data: Buffer) => void;
   collect?: boolean;
   env?: NodeJS.ProcessEnv;
 }
@@ -81,6 +82,7 @@ export function runProcess(program: string, args: string[], options: RunOptions 
     options.signal?.addEventListener("abort", abort, { once: true });
     if (options.signal?.aborted) abort();
     child.stdout.on("data", (data: Buffer) => {
+      options.onStdout?.(data);
       options.onData?.(data);
       if (options.collect !== false) {
         size += data.length;

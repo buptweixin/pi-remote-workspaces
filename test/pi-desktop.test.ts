@@ -295,12 +295,16 @@ test("buildPiDesktopPlugin produces a valid store-only .piplug archive", async t
     "package.json",
     "renderer/index.mjs",
     "runtime/extension.js",
+    "views/workbench-core.js",
     "views/workbench.html",
     "views/workbench.js",
     "views/workbench.css",
   ]) {
     assert.ok(entryNames.includes(required), `Missing ${required} in .piplug`);
   }
+  const wbHtml = await readFile(join(extractedDir, "views/workbench.html"), "utf8");
+  assert.match(wbHtml, /workbench-core\.js/);
+  assert.match(wbHtml, /name="anchorRoot"/);
 
   // Simulate PI-Desktop's plugin-host-process loading main.js from the extracted .piplug directory.
   (globalThis as Record<string, unknown>).pi = {

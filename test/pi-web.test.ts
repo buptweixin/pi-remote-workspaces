@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import {
   applyStatusPresentation, browseRemoteFiles, buildPiWebStatusSnapshot, compactRemotePath,
   inspectRemoteGit, isPiWebHost, normalizeWorkspaceRelPath, openRemoteFileEditor,
-  parseGitShortStatus, PI_WEB_SESSION_LIVENESS_KEY, PiWebLivenessLease, type PiWebLivenessProvider,
+  parseGitShortStatus, parseGrepOutputLine, PI_WEB_SESSION_LIVENESS_KEY, PiWebLivenessLease, type PiWebLivenessProvider,
 } from "../src/pi-web.js";
 import { sshFixture } from "./ssh-fixture.js";
 import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
@@ -19,6 +19,11 @@ test("pi-web status shelf protocol, command button ordering, path compaction and
   assert.equal(compactRemotePath("/home/dev", "/home/dev"), "~");
   assert.equal(normalizeWorkspaceRelPath("/srv/app/src/index.ts", "/srv/app"), "src/index.ts");
   assert.throws(() => normalizeWorkspaceRelPath("../../etc/passwd", "/srv/app"), /超出远程工作区根目录/);
+  assert.deepEqual(parseGrepOutputLine("logs/2026:11:25.log:42: const port: number = 8080;"), {
+    path: "logs/2026:11:25.log",
+    lineNumber: 42,
+    snippet: "const port: number = 8080;",
+  });
 
   // Local unbound state in pi-web shows clickable `command:/remote` button (`SSH: 本地`)
   const localSnap = buildPiWebStatusSnapshot({ mode: "local" });

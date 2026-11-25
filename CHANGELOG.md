@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.0 - 2026-11-25
+
+- Pool streaming `bash` / `remote_bash` / workbench `exec` commands over warm SSH Python workers with automatic `/bin/sh` fallback, macOS/custom `python3` PATH recovery, and immediate remote process-group cleanup on client disconnect or cancellation.
+- Encode the remote Python bootstrap as a single-line compressed ASCII command compatible with non-POSIX login shells (`fish`, `csh`, `tcsh`), add per-host concurrency limits with FIFO slot queuing in `RemotePool`, respect explicit `StrictHostKeyChecking` / `ConnectTimeout` / `ServerAliveInterval` settings in `~/.ssh/config`, and retry idempotent file writes across stale idle connections.
+- Expose read-only `local_read`, `local_ls`, `local_find`, and `local_grep` tools when bound to an SSH workspace in native `pi` / `pi-web` mode so sessions can inspect local files without unbinding.
+- Add `ripgrep`-free remote `find` / `grep` fallback (`git ls-files` or streaming `os.walk` with vendor directory pruning) and stream line-range reads up to 128 MiB with C-level newline scanning, single-line >50 KB truncation guards, and fast head-only previews for >512 KiB / >8 MiB files.
+- Upgrade PI-Desktop, standalone dashboard, and `pi-web` modals with shared `workbench-core.js` codecs, live post-turn workbench refresh, Composer pill `blocked`-state recovery, interactive per-file Git status/diff inspection, `glob` search filters, colon-safe grep navigation, UTF-8 BOM + CRLF preservation with conflict-overwrite confirmation, and remote `mkdir` / `rename` / `delete` file management.
+- Harden `ConfigStore` defensive mtime/size caching, dynamic remote `AGENTS.md` / `CLAUDE.md` cache invalidation, `PATCH /api/config` partial updates, fresh TypeScript compilation in `.piplug` builds, and per-version GitHub Release notes extraction.
+
 ## 0.5.0 - 2026-11-20
 
 - Manage clean local anchor directories (`~/.pi/remote-workspaces/<workspace-id>` and shared `~/.pi/remote-workspaces`) so `pi-web` sessions can connect to SSH workspaces without piggybacking on a local project.

@@ -2,22 +2,22 @@
 
 const $ = (id) => document.getElementById(id);
 const bridge = window.pluginBridge;
+const Core = window.PiRemoteWorkbenchCore;
 
 let state = { config: { workspaces: [] }, inventory: { hosts: [], warnings: [] } };
 let session = { active: null, sessionId: "", state: { mode: "local" } };
 let selected = null;
 let directory = ".";
 let openDoc = null;
+let currentViewPath = "";
 let editingId = "";
 let activeGitAction = "status";
 let execController = null;
-let resolveTimer = null;
-let resolveController = null;
 let toastTimer = null;
 let readSeq = 0;
 let nextReqId = 0;
 let lastBoundWorkspaceId = "";
-const MAX_INLINE_EDITOR_BYTES = 512 * 1024;
+let prevActiveTurnId = "";
 
 function invoke(channel, payload = {}) {
   if (!bridge?.invoke) throw new Error("请在 PI-Desktop 工作面板中打开此视图");
@@ -64,12 +64,12 @@ function initAppearanceSync() {
 }
 
 function toast(msg, isError = false) {
-  const el = $("toast");
-  el.textContent = msg;
-  el.className = isError ? "wb-toast is-err" : "wb-toast";
-  el.hidden = false;
+  const elNode = $("toast");
+  elNode.textContent = msg;
+  elNode.className = isError ? "wb-toast is-err" : "wb-toast";
+  elNode.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { el.hidden = true; }, isError ? 6000 : 3200);
+  toastTimer = setTimeout(() => { elNode.hidden = true; }, isError ? 6000 : 3200);
 }
 
 const runSafe = (fn) => async (event) => {
@@ -95,12 +95,15 @@ function el(tag, text, className) {
 function clearEditor() {
   readSeq += 1;
   openDoc = null;
+  currentViewPath = "";
   $("editor-path").textContent = "选择左侧文件查看或编辑";
   $("editor-input").readOnly = false;
   $("editor-input").hidden = true;
   $("editor-empty").hidden = false;
   $("save-file").disabled = true;
   $("reload-file").disabled = true;
+  $("rename-file").disabled = true;
+  $("delete-file").disabled = true;
   $("editor-dirty").hidden = true;
   syncActiveTreeRow();
 }
@@ -113,7 +116,7 @@ function syncDirtyState() {
 
 function syncActiveTreeRow() {
   for (const row of $("file-list").querySelectorAll(".wb-entry")) {
-    row.classList.toggle("active", Boolean(openDoc && row.dataset.path === openDoc.path));
+    row.classList.toggle("active", Boolean(currentViewPath && row.dataset.path === currentViewPath));
   }
 }
 
@@ -206,12 +209,27 @@ async function selectWorkspace(ws) {
   await loadDirectory();
 }
 
+async function refreshBoundAfterTurn() {
+  if (!selected) return;
+  await loadDirectory().catch(() => {});
+  if (currentViewPath && !isDirty()) {
+    await openFile(currentViewPath, true).catch(() => {});
+  }
+  if (!$("tab-git").hidden) {
+    await loadGit(activeGitAction).catch(() => {});
+  }
+}
+
 async function syncSessionState(followBoundWorkspace = false) {
   try {
     session = await invoke("pi-remote.sessionStatus");
   } catch {
     session = { active: null, sessionId: "", state: { mode: "local" } };
   }
+  const nextTurnId = session.active?.activeTurn?.turnId || "";
+  const turnJustCompleted = Boolean(prevActiveTurnId && !nextTurnId);
+  prevActiveTurnId = nextTurnId;
+
   const boundId = session.state?.mode === "remote" ? session.state.binding?.workspace?.id : "";
   if (boundId && boundId !== lastBoundWorkspaceId) {
     lastBoundWorkspaceId = boundId;
@@ -226,6 +244,9 @@ async function syncSessionState(followBoundWorkspace = false) {
     lastBoundWorkspaceId = "";
   }
   renderSessionChip();
+  if (turnJustCompleted && selected && boundId === selected.id) {
+    await refreshBoundAfterTurn();
+  }
 }
 
 async function refreshAll(followSession = false) {
@@ -254,7 +275,8 @@ async function loadDirectory() {
   $("dir-label").title = targetDir;
   $("up-dir").disabled = targetDir === ".";
 
-  const sorted = [...entries].filter((e) => !e.escaped).sort((a, b) => {
+  const sorted = [...entries].sort((a, b) => {
+    if (Boolean(a.escaped) !== Boolean(b.escaped)) return a.escaped ? 1 : -1;
     if (a.directory !== b.directory) return a.directory ? -1 : 1;
     return a.name.localeCompare(b.name);
   });
@@ -262,14 +284,22 @@ async function loadDirectory() {
   $("file-list").replaceChildren(
     ...sorted.map((entry) => {
       const rel = targetDir === "." ? entry.name : `${targetDir}/${entry.name}`;
-      const btn = el("button", undefined, `wb-entry${entry.directory ? " is-dir" : ""}${openDoc?.path === rel ? " active" : ""}`);
+      const btn = el(
+        "button",
+        undefined,
+        `wb-entry${entry.directory ? " is-dir" : ""}${entry.escaped ? " is-escaped" : ""}${currentViewPath === rel ? " active" : ""}`,
+      );
       btn.type = "button";
       btn.dataset.path = rel;
       btn.append(
-        el("span", entry.directory ? "▸" : entry.symlink ? "↗" : "·", "wb-entry-icon"),
-        el("span", entry.name, "wb-entry-name"),
+        el("span", entry.escaped ? "⚠" : entry.directory ? "▸" : entry.symlink ? "↗" : "·", "wb-entry-icon"),
+        el("span", entry.escaped ? `${entry.name} (越界软链)` : entry.name, "wb-entry-name"),
       );
       btn.onclick = runSafe(async () => {
+        if (entry.escaped) {
+          toast(`软链接 ${entry.name} 指向工作区外部，已被安全策略阻止`, true);
+          return;
+        }
         if (entry.directory) {
           directory = rel;
           await loadDirectory();
@@ -285,40 +315,49 @@ async function loadDirectory() {
   }
 }
 
+async function jumpToFile(relPath, lineNumber = 0) {
+  switchTab("files");
+  const slash = relPath.lastIndexOf("/");
+  directory = slash > 0 ? relPath.slice(0, slash) : ".";
+  await loadDirectory();
+  await openFile(relPath, false, lineNumber);
+}
+
 async function openFile(relPath, force = false, lineNumber = 0) {
   if (!selected) return;
   if (!force && !canDiscard()) return;
   const wsId = selected.id;
   const seq = ++readSeq;
-  const result = await api(wsPath("read"), "POST", { path: relPath });
+  const result = await api(wsPath("read"), "POST", {
+    path: relPath,
+    maxEditableBytes: Core.MAX_INLINE_EDITOR_BYTES,
+    previewBytes: Core.PREVIEW_HEAD_BYTES,
+  });
   if (selected?.id !== wsId || seq !== readSeq) return;
-  const bytes = Uint8Array.from(atob(result.data), (c) => c.charCodeAt(0));
-  if (bytes.subarray(0, 8192).includes(0)) throw new Error("二进制文件暂不支持文本编辑");
-
+  const decoded = Core.decodeRemoteDocument(relPath, result, Core.PREVIEW_HEAD_BYTES);
   const textarea = $("editor-input");
-  if (bytes.length > MAX_INLINE_EDITOR_BYTES) {
-    const preview = new TextDecoder("utf-8", { fatal: false }).decode(bytes.subarray(0, 64 * 1024));
-    textarea.value = preview;
+  currentViewPath = relPath;
+  $("rename-file").disabled = false;
+  $("delete-file").disabled = false;
+
+  if (decoded.kind === "preview") {
+    textarea.value = decoded.text;
     textarea.readOnly = true;
     openDoc = null;
-    const label = `${relPath}（${(bytes.length / 1024).toFixed(1)} KiB · 只读前 64 KiB 预览）`;
-    $("editor-path").textContent = label;
-    $("editor-path").title = label;
+    $("editor-path").textContent = decoded.label;
+    $("editor-path").title = decoded.label;
     $("editor-empty").hidden = true;
     textarea.hidden = false;
     $("save-file").disabled = true;
-    $("reload-file").disabled = true;
+    $("reload-file").disabled = false;
     $("editor-dirty").hidden = true;
     syncActiveTreeRow();
     return;
   }
 
-  const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
-  const crlf = text.includes("\r\n") && !text.replaceAll("\r\n", "").includes("\n");
-
   textarea.readOnly = false;
-  textarea.value = text;
-  openDoc = { path: relPath, etag: result.etag, saved: textarea.value, crlf };
+  textarea.value = decoded.text;
+  openDoc = { path: relPath, etag: decoded.etag, saved: textarea.value, crlf: decoded.crlf, hasBom: decoded.hasBom };
   $("editor-path").textContent = relPath;
   $("editor-path").title = relPath;
   $("editor-empty").hidden = true;
@@ -326,36 +365,50 @@ async function openFile(relPath, force = false, lineNumber = 0) {
   $("reload-file").disabled = false;
   syncActiveTreeRow();
   syncDirtyState();
-
-  if (lineNumber > 1) {
-    const lines = textarea.value.split("\n");
-    let pos = 0;
-    for (let i = 0; i < Math.min(lineNumber - 1, lines.length); i++) pos += lines[i].length + 1;
-    textarea.focus();
-    textarea.setSelectionRange(pos, pos);
-    const approxLineHeight = 19.2;
-    textarea.scrollTop = Math.max(0, (lineNumber - 4) * approxLineHeight);
-  }
+  Core.scrollTextareaToLine(textarea, lineNumber, 19.2);
 }
 
-function renderGitDiff(text) {
-  const container = $("git-output");
-  if (!text) {
-    container.textContent = "工作区干净，没有未提交改动。";
+const gitClasses = {
+  add: "wb-diff-add",
+  del: "wb-diff-del",
+  hunk: "wb-diff-hunk",
+  hint: "wb-hint",
+  statusBranch: "wb-git-branch",
+  statusRow: "wb-git-row",
+  statusMainBtn: "wb-git-main",
+  statusCode: "wb-git-code",
+  statusPath: "wb-git-path",
+  miniBtn: "wb-btn",
+  diffToolbar: "wb-diff-toolbar",
+  diffHeaderLabel: "wb-diff-title",
+  diffFileBtn: "wb-diff-file",
+};
+
+async function inspectSingleFileDiff(change) {
+  if (!selected) return;
+  const wsId = selected.id;
+  $("git-output").textContent = `正在读取 ${change.path} 的变更…`;
+  const [unstaged, staged] = await Promise.all([
+    api(wsPath("git"), "POST", { action: "diff", path: change.path }),
+    api(wsPath("git"), "POST", { action: "staged", path: change.path }),
+  ]);
+  if (selected?.id !== wsId) return;
+  const combined = [
+    unstaged.text?.trim() ? `# 工作区未暂存变更 (${change.path})\n${unstaged.text.trim()}` : "",
+    staged.text?.trim() ? `# 暂存区变更 (${change.path})\n${staged.text.trim()}` : "",
+  ].filter(Boolean).join("\n\n");
+  if (!combined && change.code === "??") {
+    await jumpToFile(change.path);
     return;
   }
-  container.replaceChildren(
-    ...text.split("\n").map((line) => {
-      const cls = line.startsWith("+") && !line.startsWith("+++")
-        ? "wb-diff-add"
-        : line.startsWith("-") && !line.startsWith("---")
-          ? "wb-diff-del"
-          : line.startsWith("@@")
-            ? "wb-diff-hunk"
-            : "";
-      return el("div", line || " ", cls);
-    }),
-  );
+  Core.renderDiffLines($("git-output"), {
+    text: combined,
+    classes: gitClasses,
+    emptyText: `${change.path} 暂无文本 Diff`,
+    headerTitle: `[${change.code}] ${change.path}`,
+    onBack: () => { void runSafe(() => loadGit("status"))(); },
+    onOpenFile: (rel) => { void runSafe(() => jumpToFile(rel))(); },
+  });
 }
 
 async function loadGit(action = activeGitAction) {
@@ -368,74 +421,32 @@ async function loadGit(action = activeGitAction) {
   $("git-output").textContent = "正在读取远程 Git…";
   const res = await api(wsPath("git"), "POST", { action });
   if (selected?.id !== wsId) return;
+  if (action === "status") {
+    Core.renderGitStatusInteractive($("git-output"), {
+      text: res.text || "",
+      truncated: res.truncated,
+      classes: gitClasses,
+      onInspectFileDiff: (item) => { void runSafe(() => inspectSingleFileDiff(item))(); },
+      onOpenFile: (rel) => { void runSafe(() => jumpToFile(rel))(); },
+    });
+    return;
+  }
   const raw = (res.text || "") + (res.truncated ? "\n[输出已截断]" : "");
-  renderGitDiff(raw);
+  Core.renderDiffLines($("git-output"), {
+    text: raw,
+    classes: gitClasses,
+    emptyText: "工作区干净，没有未提交改动。",
+    onOpenFile: (rel) => { void runSafe(() => jumpToFile(rel))(); },
+  });
 }
 
-function renderSearchResults(text, mode, truncated) {
-  const container = $("search-output");
-  if (!text) {
-    container.textContent = "没有找到匹配项。";
-    return;
-  }
-  const lines = text.split("\n").filter(Boolean);
-  container.replaceChildren(
-    ...lines.map((line) => {
-      if (mode === "find") {
-        const btn = el("button", line, "wb-hit");
-        btn.type = "button";
-        btn.onclick = runSafe(async () => {
-          switchTab("files");
-          const slash = line.lastIndexOf("/");
-          directory = slash > 0 ? line.slice(0, slash) : ".";
-          await loadDirectory();
-          await openFile(line, false);
-        });
-        return btn;
-      }
-      const match = /^([^:\n]+):(\d+):(.*)$/.exec(line);
-      if (!match) return el("div", line);
-      const [, filePath, lineStr, snippet] = match;
-      const btn = el("button", undefined, "wb-hit");
-      btn.type = "button";
-      btn.append(el("span", `${filePath}:${lineStr}`, "wb-hit-path"), el("span", snippet));
-      btn.onclick = runSafe(async () => {
-        switchTab("files");
-        const slash = filePath.lastIndexOf("/");
-        directory = slash > 0 ? filePath.slice(0, slash) : ".";
-        await loadDirectory();
-        await openFile(filePath, false, Number(lineStr));
-      });
-      return btn;
-    }),
-  );
-  if (truncated) container.append(el("div", "[结果已截断，请缩小搜索范围]", "wb-hint"));
-}
-
-function previewSshHost(rawHost) {
-  clearTimeout(resolveTimer);
-  resolveController?.abort();
-  const host = (rawHost || "").trim();
-  if (!host) {
-    $("host-preview").textContent = "";
-    return;
-  }
-  resolveTimer = setTimeout(async () => {
-    const controller = new AbortController();
-    resolveController = controller;
-    try {
-      const resolved = await api("/api/resolve", "POST", { host }, controller.signal);
-      if (controller.signal.aborted) return;
-      const user = resolved.user?.[0];
-      const hostname = resolved.hostname?.[0] || host;
-      const port = resolved.port?.[0];
-      const jump = resolved.proxyjump?.[0];
-      $("host-preview").textContent = `目标：${user ? `${user}@` : ""}${hostname}${port && port !== "22" ? `:${port}` : ""}${jump && jump !== "none" ? ` · Jump ${jump}` : ""}`;
-    } catch {
-      if (!controller.signal.aborted) $("host-preview").textContent = "";
-    }
-  }, 200);
-}
+const previewSshHost = Core.createHostPreviewer({
+  resolveHost: (host, signal) => api("/api/resolve", "POST", { host }, signal),
+  onPreview: (text) => { $("host-preview").textContent = text; },
+  prefixLabel: "目标：",
+  jumpLabel: "Jump",
+  delayMs: 200,
+});
 
 function openWorkspaceDialog(ws = null, presetHost = "") {
   editingId = ws?.id || "";
@@ -508,6 +519,7 @@ $("ws-delete").onclick = runSafe(async () => {
 $("open-settings").onclick = () => {
   const form = $("settings-form");
   form.elements.namedItem("sshConfigPath").value = state.config.sshConfigPath || "";
+  form.elements.namedItem("anchorRoot").value = state.config.anchorRoot || "";
   form.elements.namedItem("connectTimeoutSeconds").value = state.config.connectTimeoutSeconds;
   form.elements.namedItem("commandTimeoutSeconds").value = state.config.commandTimeoutSeconds;
   $("settings-error").textContent = "";
@@ -581,6 +593,17 @@ $("up-dir").onclick = runSafe(async () => {
 });
 $("refresh-dir").onclick = runSafe(loadDirectory);
 
+$("new-folder").onclick = runSafe(async () => {
+  const raw = prompt(`在 ${directory === "." ? "/" : `/${directory}`} 下新建文件夹：`, "");
+  const rel = (raw || "").trim().replace(/^\/+/, "");
+  if (!rel) return;
+  const target = directory === "." ? rel : `${directory}/${rel}`;
+  await api(wsPath("mkdir"), "POST", { path: target });
+  directory = target;
+  await loadDirectory();
+  toast(`已创建文件夹 ${target}`);
+});
+
 $("new-file").onclick = () => {
   if (!canDiscard()) return;
   $("newfile-form").reset();
@@ -608,6 +631,29 @@ $("newfile-form").onsubmit = async (e) => {
   }
 };
 
+$("rename-file").onclick = runSafe(async () => {
+  if (!currentViewPath || !canDiscard()) return;
+  const nextRaw = prompt("输入新的远程相对路径：", currentViewPath);
+  const nextPath = (nextRaw || "").trim().replace(/^\/+/, "");
+  if (!nextPath || nextPath === currentViewPath) return;
+  await api(wsPath("rename"), "POST", { path: currentViewPath, newPath: nextPath });
+  const slash = nextPath.lastIndexOf("/");
+  directory = slash > 0 ? nextPath.slice(0, slash) : ".";
+  await loadDirectory();
+  await openFile(nextPath, true);
+  toast(`已重命名为 ${nextPath}`);
+});
+
+$("delete-file").onclick = runSafe(async () => {
+  if (!currentViewPath) return;
+  if (!confirm(`确定永久删除远程文件「${currentViewPath}」吗？此操作不可撤销。`)) return;
+  const deleted = currentViewPath;
+  await api(wsPath("delete"), "POST", { path: deleted });
+  clearEditor();
+  await loadDirectory();
+  toast(`已删除 ${deleted}`);
+});
+
 $("editor-input").oninput = syncDirtyState;
 $("editor-input").addEventListener("keydown", (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
@@ -616,7 +662,7 @@ $("editor-input").addEventListener("keydown", (e) => {
   }
 });
 $("reload-file").onclick = runSafe(async () => {
-  if (openDoc && canDiscard()) await openFile(openDoc.path, true);
+  if (currentViewPath && canDiscard()) await openFile(currentViewPath, true);
 });
 $("save-file").onclick = runSafe(async () => {
   if (!openDoc || !selected) return;
@@ -625,12 +671,15 @@ $("save-file").onclick = runSafe(async () => {
   const raw = $("editor-input").value;
   $("save-file").disabled = true;
   try {
-    const payload = doc.crlf ? raw.replaceAll("\n", "\r\n") : raw;
-    const res = await api(wsPath("write"), "POST", { path: doc.path, etag: doc.etag, content: payload });
-    if (selected?.id === wsId && openDoc === doc) {
-      openDoc.etag = res.etag;
+    const payload = Core.encodeRemoteSave(doc, raw);
+    const outcome = await Core.saveWithConflictConfirm(
+      (useEtag) => api(wsPath("write"), "POST", { path: doc.path, ...(useEtag ? { etag: doc.etag } : {}), content: payload }),
+      `远程文件 ${doc.path} 在编辑期间已被修改（如 Agent 刚刚更新），是否强制覆盖保存？`,
+    );
+    if (outcome.saved && selected?.id === wsId && openDoc === doc) {
+      openDoc.etag = outcome.result.etag;
       openDoc.saved = raw;
-      toast("已保存到远程主机");
+      toast(outcome.forced ? "已强制覆盖保存到远程主机" : "已保存到远程主机");
     }
   } finally {
     syncDirtyState();
@@ -642,24 +691,39 @@ for (const btn of document.querySelectorAll("[data-git]")) {
 }
 $("refresh-git").onclick = runSafe(() => loadGit(activeGitAction));
 
-$("search-mode").onchange = () => {
+const syncSearchMode = () => {
   const isFind = $("search-mode").value === "find";
   $("search-literal").disabled = isFind;
   $("search-icase").disabled = isFind;
+  $("search-glob").disabled = isFind;
 };
+$("search-mode").onchange = syncSearchMode;
+syncSearchMode();
+
 $("search-form").onsubmit = runSafe(async () => {
   if (!selected) return;
   const wsId = selected.id;
   const mode = $("search-mode").value;
+  const glob = $("search-glob").value.trim();
   $("search-output").textContent = "正在搜索…";
   const res = await api(wsPath("search"), "POST", {
     pattern: $("search-input").value,
     mode,
+    ...(mode === "grep" && glob ? { glob } : {}),
     literal: $("search-literal").checked,
     ignoreCase: $("search-icase").checked,
     limit: 200,
   });
-  if (selected?.id === wsId) renderSearchResults(res.text, mode, res.truncated);
+  if (selected?.id === wsId) {
+    Core.renderSearchHits($("search-output"), {
+      text: res.text,
+      mode,
+      truncated: res.truncated,
+      classes: { hit: "wb-hit", hitPath: "wb-hit-path", hint: "wb-hint" },
+      emptyText: "没有找到匹配项。",
+      onOpenHit: (relPath, lineNo) => { void runSafe(() => jumpToFile(relPath, lineNo))(); },
+    });
+  }
 });
 
 $("exec-form").onsubmit = runSafe(async () => {
@@ -683,6 +747,13 @@ $("exec-form").onsubmit = runSafe(async () => {
 });
 $("exec-cancel").onclick = () => execController?.abort();
 
+window.addEventListener("beforeunload", (event) => {
+  if (isDirty()) {
+    event.preventDefault();
+    event.returnValue = "";
+  }
+});
+
 if (document.documentElement.dataset.piPluginPanelShape === "view") {
   $("popout-btn").hidden = false;
 }
@@ -694,6 +765,6 @@ document.addEventListener("visibilitychange", () => {
 });
 window.setInterval(() => {
   if (document.visibilityState !== "hidden") void syncSessionState(true);
-}, 10000);
+}, 4000);
 
 void runSafe(() => refreshAll(true))();

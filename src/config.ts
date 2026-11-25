@@ -188,18 +188,61 @@ export function parsePersistedSessionState(value: unknown): PersistedSessionStat
   return { mode: "blocked", error: "Invalid saved workspace binding; select a workspace with /remote" };
 }
 
+function cloneConfig(config: RemoteConfig): RemoteConfig {
+  return {
+    ...config,
+    workspaces: config.workspaces.map(w => ({ ...w })),
+  };
+}
+
 export class ConfigStore {
+  private cache?: { ino: number; size: number; mtimeMs: number; ctimeMs: number; config: RemoteConfig };
+
   constructor(readonly file = configFile()) {}
-  async read(): Promise<RemoteConfig> {
-    try { return validateConfig(JSON.parse(await readFile(this.file, "utf8"))); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return defaults(); throw error; }
+
+  private async readUncached(): Promise<RemoteConfig> {
+    try {
+      const [info, raw] = await Promise.all([stat(this.file), readFile(this.file, "utf8")]);
+      const validated = validateConfig(JSON.parse(raw));
+      this.cache = { ino: info.ino, size: info.size, mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs, config: validated };
+      return cloneConfig(validated);
+    } catch (error) {
+      this.cache = undefined;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return defaults();
+      throw error;
+    }
   }
+
+  async read(): Promise<RemoteConfig> {
+    try {
+      const info = await stat(this.file);
+      if (
+        this.cache
+        && this.cache.ino === info.ino
+        && this.cache.size === info.size
+        && this.cache.mtimeMs === info.mtimeMs
+        && this.cache.ctimeMs === info.ctimeMs
+      ) {
+        return cloneConfig(this.cache.config);
+      }
+    } catch (error) {
+      this.cache = undefined;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return defaults();
+      throw error;
+    }
+    return this.readUncached();
+  }
+
   async update(change: (config: RemoteConfig) => RemoteConfig): Promise<RemoteConfig> {
     const release = await acquireFileLock(this.file);
     try {
-      const config = validateConfig(change(await this.read()));
+      const config = validateConfig(change(await this.readUncached()));
       await atomicWriteJson(this.file, config);
-      return config;
+      const info = await stat(this.file).catch(() => undefined);
+      this.cache = info
+        ? { ino: info.ino, size: info.size, mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs, config }
+        : undefined;
+      return cloneConfig(config);
     } finally {
       await release();
     }

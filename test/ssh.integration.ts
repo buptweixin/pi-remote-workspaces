@@ -117,6 +117,18 @@ test("real OpenSSH transport, actual SDK loading, session binding and isolation"
   }
   assert.equal(pool.size, 1, "consecutive RPCs should reuse the single warm SSH worker");
 
+  // Pooled bash reuses the same warm SSH worker with zero extra SSH handshakes and streams stdout/stderr.
+  const streamedBashChunks: string[] = [];
+  const pooledBash = await pooledClient.bash("printf 'out-1\\n'; printf 'err-1\\n' >&2", fixture.root, {
+    onData: chunk => streamedBashChunks.push(chunk.toString("utf8")),
+  });
+  assert.equal(pooledBash.exitCode, 0);
+  assert.equal(pooledBash.stdout.toString("utf8"), "out-1\n");
+  assert.equal(pooledBash.stderr.toString("utf8"), "err-1\n");
+  assert.match(streamedBashChunks.join(""), /out-1/);
+  assert.match(streamedBashChunks.join(""), /err-1/);
+  assert.equal(pool.size, 1, "pooled bash should reuse the existing warm SSH worker");
+
   const burstResults = await Promise.all(
     Array.from({ length: 8 }, () => pooledClient.read("actual-ssh.txt")),
   );
@@ -152,6 +164,15 @@ test("real OpenSSH transport, actual SDK loading, session binding and isolation"
   assert.equal(built.systemPromptOptions.cwd, remoteDir);
   assert.ok(built.systemPromptOptions.contextFiles.some(f => f.content.includes("REMOTE_PROJECT_INSTRUCTIONS")));
   assert.ok(!built.systemPromptOptions.contextFiles.some(f => f.content.includes("LOCAL_ONLY_SECRET_CONTEXT")));
+
+  // Editing remote AGENTS.md via remote write tool automatically invalidates remoteContextCache for the next turn.
+  const isolatedWrite = isolated.agent.state.tools.find(tool => tool.name === "write")!;
+  await isolatedWrite.execute("w-agents", { path: "AGENTS.md", content: "UPDATED_REMOTE_AGENTS_V2\n" }, undefined);
+  const builtAfterUpdate = await isolated.extensionRunner.emitBeforeAgentStart(
+    { type: "before_agent_start", messageType: "user", prompt: "inspect again" } as any,
+    isolated.extensionRunner.createCommandContext().getSystemPromptOptions(),
+  );
+  assert.ok(builtAfterUpdate.systemPromptOptions.contextFiles.some(f => f.content.includes("UPDATED_REMOTE_AGENTS_V2")));
 
   await isolated.prompt("/remote remove remote-repo");
   assert.ok(!(await fixture.store.read()).workspaces.some(w => w.id === "remote-repo"));

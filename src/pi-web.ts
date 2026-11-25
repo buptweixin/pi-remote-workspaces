@@ -221,22 +221,30 @@ export function normalizeWorkspaceRelPath(input: string, root?: string): string 
 }
 
 const MAX_INLINE_EDITOR_BYTES = 512 * 1024;
+const PREVIEW_HEAD_BYTES = 32 * 1024;
+
+export function parseGrepOutputLine(line: string): { path: string; lineNumber: number; snippet: string } | null {
+  const match = /^(.+?):(\d+):(?:\s|$)(.*)$/.exec(line);
+  if (!match) return null;
+  return { path: match[1]!, lineNumber: Number(match[2]), snippet: match[3] ?? "" };
+}
 
 export async function openRemoteFileEditor(
   client: RemoteClient,
   relPath: string,
   ui: Pick<ExtensionUIContext, "editor" | "confirm" | "notify">,
 ): Promise<{ saved: boolean }> {
-  const file = await client.read(relPath);
+  const file = await client.read(relPath, undefined, { maxEditableBytes: MAX_INLINE_EDITOR_BYTES, previewBytes: PREVIEW_HEAD_BYTES });
   const raw = Buffer.from(file.data, "base64");
   if (raw.subarray(0, 8192).includes(0)) {
-    ui.notify(`二进制文件 (${raw.length} bytes)，无法在文本编辑器中打开：${relPath}`, "warning");
+    ui.notify(`二进制文件 (${file.totalBytes ?? raw.length} bytes)，无法在文本编辑器中打开：${relPath}`, "warning");
     return { saved: false };
   }
-  if (raw.length > MAX_INLINE_EDITOR_BYTES) {
-    const preview = new TextDecoder("utf-8", { fatal: false }).decode(raw.subarray(0, 32 * 1024));
+  if (file.preview || raw.length > MAX_INLINE_EDITOR_BYTES) {
+    const totalBytes = file.totalBytes ?? raw.length;
+    const preview = new TextDecoder("utf-8", { fatal: false }).decode(raw.subarray(0, PREVIEW_HEAD_BYTES));
     await ui.editor(
-      `${client.workspace.host}:${relPath}（文件较大 ${(raw.length / 1024).toFixed(1)} KiB · 只读前 32 KiB 预览）`,
+      `${client.workspace.host}:${relPath}（文件较大 ${(totalBytes / 1024).toFixed(1)} KiB · 只读前 32 KiB 预览）`,
       preview,
     );
     return { saved: false };
@@ -303,6 +311,8 @@ export async function browseRemoteFiles(
     const findItem = "🔍 按文件名搜索 (find)";
     const grepItem = "🔎 按内容搜索 (grep)";
     const createItem = "➕ 在当前目录新建文件";
+    const mkdirItem = "📁 在当前目录新建文件夹";
+    const manageItem = entries.length > 0 ? "⚙ 重命名 / 删除当前目录项" : undefined;
 
     const entryLabels = entries.map((entry: DirectoryEntry) => {
       if (entry.escaped) return `⚠ ${entry.name} (越界软链 · 已阻止)`;
@@ -310,7 +320,7 @@ export async function browseRemoteFiles(
       return `📄 ${entry.name}${entry.symlink ? " (symlink)" : ""}`;
     });
 
-    const topActions = [upItem, findItem, grepItem, createItem].filter((v): v is string => Boolean(v));
+    const topActions = [upItem, findItem, grepItem, createItem, mkdirItem, manageItem].filter((v): v is string => Boolean(v));
     const displayDir = currentDir === "." ? root : `${root.replace(/\/+$/, "")}/${currentDir}`;
     const choice = await ui.select(
       `远程文件 · ${client.workspace.host}:${displayDir}`,
@@ -333,6 +343,49 @@ export async function browseRemoteFiles(
       if (initialContent === undefined) continue;
       await client.write(targetRel, initialContent, null);
       ui.notify(`已创建远程文件：${targetRel}`, "info");
+      continue;
+    }
+
+    if (choice === mkdirItem) {
+      const rawName = await ui.input("新建远程文件夹（相对当前目录）", "例如 src/components");
+      const trimmed = rawName?.trim();
+      if (!trimmed) continue;
+      const targetRel = normalizeWorkspaceRelPath(currentDir === "." ? trimmed : `${currentDir}/${trimmed}`, root);
+      await client.mkdir(targetRel);
+      ui.notify(`已创建远程文件夹：${targetRel}`, "info");
+      continue;
+    }
+
+    if (choice === manageItem) {
+      const selectable = entries.filter(e => !e.escaped);
+      if (!selectable.length) {
+        ui.notify("当前目录没有可管理的有效条目", "info");
+        continue;
+      }
+      const labels = selectable.map(e => `${e.directory ? "📁" : "📄"} ${e.name}${e.directory ? "/" : ""}`);
+      const targetLabel = await ui.select("选择要重命名或删除的远程条目", labels);
+      if (!targetLabel) continue;
+      const item = selectable[labels.indexOf(targetLabel)]!;
+      const sourceRel = normalizeWorkspaceRelPath(currentDir === "." ? item.name : `${currentDir}/${item.name}`, root);
+      const renameOpt = "✏️ 重命名 / 移动路径";
+      const deleteOpt = "🗑 删除此条目";
+      const op = await ui.select(`管理 · ${sourceRel}`, [renameOpt, deleteOpt]);
+      if (op === renameOpt) {
+        const nextInput = (await ui.input("输入新的工作区相对路径", sourceRel))?.trim();
+        if (!nextInput || nextInput === sourceRel) continue;
+        const nextRel = normalizeWorkspaceRelPath(nextInput, root);
+        await client.rename(sourceRel, nextRel);
+        ui.notify(`已重命名：${sourceRel} -> ${nextRel}`, "info");
+      } else if (op === deleteOpt) {
+        const confirmed = await ui.confirm(
+          "确认删除远程文件",
+          `确定永久删除远程${item.directory ? "文件夹及其全部内容" : "文件"}「${sourceRel}」吗？此操作不可撤销。`,
+        );
+        if (confirmed) {
+          await client.remove(sourceRel, { recursive: item.directory });
+          ui.notify(`已删除远程条目：${sourceRel}`, "info");
+        }
+      }
       continue;
     }
 
@@ -363,16 +416,15 @@ export async function browseRemoteFiles(
       const output = await client.rpc<TextOutput>("grep", { path: currentDir, pattern, limit: 80 });
       const lines = output.text
         .split(/\r?\n/)
-        .map(line => line.trim())
-        .filter(line => line && !line.startsWith("["));
+        .filter(line => line.trim().length > 0 && !line.startsWith("["));
       if (!lines.length) {
         ui.notify(`未找到包含「${pattern}」的内容`, "info");
         continue;
       }
       const picked = await ui.select(`内容搜索结果 · ${pattern}（选择打开对应文件）`, lines);
       if (!picked) continue;
-      const match = /^(.+?):\d+:/.exec(picked);
-      const filePart = match ? match[1]! : picked;
+      const parsedHit = parseGrepOutputLine(picked);
+      const filePart = parsedHit ? parsedHit.path : picked.trim();
       const targetRel = normalizeWorkspaceRelPath(currentDir === "." ? filePart : `${currentDir}/${filePart}`, root);
       await openRemoteFileEditor(client, targetRel, ui);
       continue;

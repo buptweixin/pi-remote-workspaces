@@ -102,6 +102,7 @@ function WorkspaceDialog({ snapshot, onRefresh, onStartJob, busyWorkspaceId, ban
 
   const boundWorkspace = snapshot.state?.mode === "remote" ? snapshot.state.binding?.workspace : null;
   const boundProbe = snapshot.state?.mode === "remote" ? snapshot.state.binding?.probe : null;
+  const blockedError = snapshot.state?.mode === "blocked" ? (snapshot.state.error || "远程工作区不可用") : "";
 
   const openAddForm = (presetHost = "") => {
     setConfirmDeleteId("");
@@ -291,17 +292,34 @@ function WorkspaceDialog({ snapshot, onRefresh, onStartJob, busyWorkspaceId, ban
                   "切回本地",
                 ),
               )
-            : h(
-                "div",
-                { className: "pir-subbar" },
-                h(
-                  "span",
-                  null,
-                  snapshot.activeSessionId
-                    ? "选择下方工作区即可绑定当前会话（remote_* 与本地工具共存）"
-                    : "当前未打开会话，可先管理工作区或打开右侧面板",
+            : blockedError
+              ? h(
+                  "div",
+                  { className: "pir-active-banner" },
+                  h("span", { className: "pir-dot pir-dot-err" }),
+                  h(
+                    "div",
+                    { className: "pir-active-copy" },
+                    h("strong", null, "SSH 远程工作区不可用"),
+                    h("span", null, blockedError),
+                  ),
+                  h(
+                    "button",
+                    { type: "button", className: "pir-ghost-btn", onClick: handleUnbind },
+                    "切回本地",
+                  ),
+                )
+              : h(
+                  "div",
+                  { className: "pir-subbar" },
+                  h(
+                    "span",
+                    null,
+                    snapshot.activeSessionId
+                      ? "选择下方工作区即可绑定当前会话（remote_* 与本地工具共存）"
+                      : "当前未打开会话，可先管理工作区或打开右侧面板",
+                  ),
                 ),
-              ),
           bannerError ? h("div", { className: "pir-alert pir-alert-err" }, bannerError) : null,
           probeInfo ? h("div", { className: "pir-alert pir-alert-ok" }, probeInfo.text) : null,
           (snapshot.workspaces?.length ?? 0) > 0
@@ -537,15 +555,20 @@ function SshComposerPill() {
   }, [activeJob?.id, refresh]);
 
   const bound = snapshot.state?.mode === "remote" ? snapshot.state.binding : null;
+  const blocked = snapshot.state?.mode === "blocked" ? (snapshot.state.error || "远程工作区不可用") : "";
   const isConnecting = Boolean(activeJob && activeJob.status === "connecting");
   const label = isConnecting
     ? "SSH 连接中…"
     : bound
       ? `${bound.workspace.host}:${leafFolder(bound.probe?.root || bound.workspace.path)}`
-      : "SSH";
+      : blocked
+        ? "SSH 不可用"
+        : "SSH";
   const tooltip = bound
     ? `当前会话已绑定 SSH 工作区：${bound.workspace.host}:${bound.probe?.root || bound.workspace.path}（点击切换或打开文件面板）`
-    : "绑定或切换 SSH 远程工作区";
+    : blocked
+      ? `SSH 远程工作区不可用：${blocked}（点击重连或切回本地）`
+      : "绑定或切换 SSH 远程工作区";
 
   return h(
     "span",
@@ -555,7 +578,8 @@ function SshComposerPill() {
       {
         type: "button",
         className: "pir-pill",
-        "data-bound": bound ? "true" : "false",
+        "data-bound": bound || blocked ? "true" : "false",
+        "data-blocked": blocked ? "true" : "false",
         "data-connecting": isConnecting ? "true" : "false",
         title: tooltip,
         "aria-label": tooltip,
@@ -571,7 +595,9 @@ function SshComposerPill() {
         ? h("span", { className: "pir-spinner", "aria-hidden": "true" })
         : bound
           ? h("span", { className: "pir-dot pir-dot-ok", "aria-hidden": "true" })
-          : h(ServerIcon, { size: 13.5 }),
+          : blocked
+            ? h("span", { className: "pir-dot pir-dot-err", "aria-hidden": "true" })
+            : h(ServerIcon, { size: 13.5 }),
       h("span", { className: "pir-pill-label" }, label),
     ),
     open
@@ -633,6 +659,9 @@ const COMPOSER_CSS = `
 }
 .pir-dot-ok {
   background: var(--ds-success, #3fb950);
+}
+.pir-dot-err {
+  background: var(--ds-error, #f85149);
 }
 .pir-spinner {
   width: 11px;

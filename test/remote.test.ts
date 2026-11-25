@@ -348,4 +348,42 @@ test("compressed bootstrap is single-line shell-safe, search works without ripgr
   const nativeSliceText = (nativeSlice.content[0] as { text: string }).text;
   assert.match(nativeSliceText, /SPECIAL_MARKER_AT_LINE_50000/);
   assert.match(nativeSliceText, /Showing lines 50000-50001 of 89001/);
+
+  // Oversized single-line minified files (<=8 MiB and >8 MiB) must respect 50 KB cap without crashing.
+  await writeFile(join(root, "bundle.min.js"), `const bundle="${"a".repeat(140_000)}";`);
+  const minSlice = await standaloneTools.remote_read.execute("min-1", { path: "bundle.min.js" }, undefined, undefined, {} as any);
+  const minText = (minSlice.content[0] as { text: string }).text;
+  assert.ok(Buffer.byteLength(minText, "utf8") <= 55_000, "Single-line minified file must be capped near 50 KB");
+  assert.match(minText, /50\.0KB limit/);
+
+  const hugeSingleLine = join(root, "huge-single.min.js");
+  await writeFile(hugeSingleLine, Buffer.alloc(9 * 1024 * 1024, 0x78)); // 9 MiB single line of 'x'
+  const hugeSingleRes = await nativeTools.read!.execute("min-huge", { path: "huge-single.min.js" }, undefined, undefined, { cwd: "/unused" } as ExtensionToolContext);
+  const hugeSingleText = (hugeSingleRes.content[0] as { text: string }).text;
+  assert.ok(Buffer.byteLength(hugeSingleText, "utf8") <= 55_000);
+  assert.match(hugeSingleText, /50\.0KB limit/);
+
+  // Fallback Python search in non-git directories prunes vendor folders like node_modules / .venv.
+  await mkdir(join(root, "node_modules/pkg"), { recursive: true });
+  await writeFile(join(root, "node_modules/pkg/index.js"), "const Needle = 'vendor-noise';\n");
+  const fallbackNoGitClient = new RemoteClient(workspace(root), defaults(), async (_prog, args, opts) => {
+    const cmd = args.at(-1)!.replace(
+      'python3 -c "',
+      'python3 -c "import shutil as _s; _orig=_s.which; _s.which=lambda n,*a,**k: None if n in (\'rg\',\'git\') else _orig(n,*a,**k); ',
+    );
+    return runProcess("/bin/sh", ["-c", cmd], opts);
+  });
+  const noGitTools = createStandaloneRemoteTools(fallbackNoGitClient, fullProbe);
+  const prunedFind = await noGitTools.remote_find.execute("f-prune", { pattern: "*.js" }, undefined, undefined, {} as any);
+  assert.doesNotMatch((prunedFind.content[0] as { text: string }).text, /node_modules/);
+
+  // File management RPCs: mkdir, rename, remove with root & escape guards.
+  await client.mkdir("managed/sub");
+  await client.write("managed/sub/note.txt", "hello");
+  await client.rename("managed/sub/note.txt", "managed/moved.txt");
+  assert.equal(Buffer.from((await client.read("managed/moved.txt")).data, "base64").toString(), "hello");
+  await assert.rejects(client.remove("."), /Cannot delete workspace root/);
+  await assert.rejects(client.rename("managed/moved.txt", "../escaped.txt"), /escapes/);
+  await client.remove("managed", { recursive: true });
+  await assert.rejects(client.read("managed/moved.txt"), /File not found/);
 });
